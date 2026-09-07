@@ -1,0 +1,1985 @@
+# problem.skill
+
+Happy-path guide for an LLM driving the proof-theoretic synthesizer
+in this repo.  The driver's job is to take a natural-language
+program spec and produce a `Problem` — the input to
+`synth.solve(...)` — consisting of three artifacts:
+
+1. A **template** — the control-flow skeleton (SB, Loop, Seq, Recur).
+2. A **predicate space** — candidate atoms for every hole the
+   template opens.
+3. A **spec** — pre, post, optional axioms and uninterpreted-function
+   declarations.
+
+The synthesizer verifies that some combination of the supplied atoms
+proves the spec for the given template, and if so emits a `(code,
+proof)` pair.
+
+This file is the working knowledge base for *steering* the
+synthesizer — what to TRY, what to AVOID, and what shapes have
+been verified.  When something goes wrong (UNSAT, timeout,
+unexpected solution, hang), see the companion `debug.skill`.
+
+**Governing principles** (P-1 through P-4) and **always-on
+reminders** (A-1 through A-4) for both the implementer and
+the driver-LLM live in [`PRINCIPLES.md`](./PRINCIPLES.md).
+Especially relevant when authoring a new benchmark:
+- **P-2** — Tier-1 axiom-free preferred over Tier-2.
+- **P-3** — dummy `axioms=["0 == 0"]` for quantified-array
+  benchmarks (force axiom-heavy Lean dispatch).
+- **A-2** — Tier-2-first authoring workflow for helpers.
+
+---
+
+## Big-picture recommendations
+
+### REC 1 — Right-size τ atoms
+
+Every τ atom should pay rent: it should be a load-bearing conjunct in
+at least one proof obligation.  Atoms added "for symmetry" or as
+redundant frame-preservation are wasted enumeration.
+
+The PLDI'09 reduction enumerates `2^|atoms|` τ subsets on the
+*inductive* constraint.  Aim for 4–7 atoms; 8 is borderline; 9+ risks
+minutes-to-hours per benchmark.
+
+**Concrete failure**: a nested-loop array benchmark first put a
+quantified prefix-zero atom and `A[i] == 0` into the inner τ "for
+symmetry" with the outer τ.  τ_inner of 7 atoms → 128 enumerated
+subsets on the inductive → Z3 hung past 7 minutes.  Trimming to the 4
+atoms that actually carry weight (the inner counter bounds) → 0.2s.
+
+### REC 2 — Use bilateral quantified atoms when invariants correlate
+
+If two invariants share structure, a single multi-variable quantified
+atom can often subsume both.  Fewer atoms ⇒ smaller enumeration.
+
+**Concrete (bubble sort)**: the two natural invariants are
+- suffix sorted: `∀p, q ∈ suffix. p ≤ q ⇒ A[p] ≤ A[q]`
+- prefix ≤ suffix: `∀p ∈ prefix, q ∈ suffix. A[p] ≤ A[q]`
+
+Both are subsumed by:
+```
+∀p, q. 0 ≤ p ≤ q < n ∧ q ≥ n - i ⇒ A[p] ≤ A[q]
+```
+- both p, q in suffix → sortedness
+- p in prefix, q in suffix → dominance
+
+### REC 3 — Atomic atoms, not composite
+
+Conjunctive τ dispatch means each indicator independently selects an
+atom *into* the conjunction.  Composite atoms (`A ∧ B`) defeat this
+— the synthesizer can't pick `A` without also picking `B`.
+
+If you mean "must hold together", let conjunctive τ do the
+conjunction: supply `A` and `B` as separate atoms.
+
+**Concrete failure**: composite atoms on quadratic-arithmetic
+problems → Z3 returned `unknown` in ~1s.  Atomic versions resolved in
+milliseconds.
+
+### REC 4 — The post drives the invariant
+
+Synthesis optimizes for *low score* (atom count), not for what a
+human would consider the "interesting" invariant.  If you want a
+specific invariant in the synthesized proof, the post (or some other
+proof obligation) must require it.
+
+**Concrete (Bresenham)**: with the post `x == dx`, the synthesizer
+produces correct Bresenham code but picks the *trivial* τ `0 ≤ x ≤
+dx`.  The algebraic invariant `v == 2·dy·x − 2·dx·y − dx + 2·dy`
+isn't load-bearing for proving termination, so it gets dropped.
+Strengthening the post to include the algebraic relation forces τ to
+carry it.
+
+If you want pixel-correctness in the proof, make the post the
+quantified pixel-correctness statement.
+
+### REC 5 — Watch for underspecified posts
+
+A weak post admits degenerate synthesized programs.
+
+**Concrete**: `max_array`'s post `∀k. A[k] ≤ m` is satisfied by
+`m := INT_MAX`, or by `m := 0` with all-non-positive `A`.  The
+synthesizer returns these before — or alongside — the "intended"
+max-of-array solution.
+
+Either tighten the post (`∃k. A[k] == m` is the cleanest), or accept
+multi-solution output and rank.
+
+### REC 6 — Always supply a ranking function
+
+Without `phi@L<id>` (per-loop) or `phi@PROC` (procedure-level), the
+synthesizer accepts non-terminating loops or diverging recursive
+calls.  The induction hypothesis is "if the call satisfies the spec,
+our body satisfies the spec" — vacuously true when the call diverges.
+
+Every Loop and every Recur needs a candidate ranking expression.  The
+framework reliably rejects non-decreasing recursive calls in **every
+context** — top-level `Recur`, `Recur` inside a chain (`Recur >> SB`,
+`Recur >> Recur >> SB`), `_recur` atoms in any branch of any SB
+(top-level, in a chain, as a Loop's body, or nested under Phase 3.K),
+and *every* `_recur` atom in a branch that contains more than one
+(per-atom decrease iteration is now reliable end-to-end).  All
+SB/Loop/Recur constraint emission lives in one centralized walker;
+there is no template shape that sneaks degenerate recursion past the
+verifier (structural guarantee banked 2026-05-14).
+
+### REC 7 — Vacuous Fpre at recursive base cases
+
+POPL'10's pure `~`-style recursive templates (no explicit conditional
+branch) rely on the spec being *structurally vacuous* at the base
+case — sortedness on a length-0 segment, zero-fill on `n = 0`, etc.
+
+The synthesizer's ranking-decrease obligation is gated on `Fpre(args)`
+(Phase 3.J), so clamped ranking expressions like `n if n > 0 else 0`
+work: when the recursive call's args violate Fpre, the IH is vacuous
+and no decrease is required.
+
+If the spec admits no natural vacuous case, the recursion needs an
+explicit base-case branch — `SB(n=2)` with a base-case branch (no
+recur) and a recur branch.
+
+### REC 8 — Place array-modifying transitions in the innermost bundle
+
+When the template offers a choice of where in the control structure an
+`Update(...)` (array store) lives, prefer the **innermost** loop's
+body over the outer body after the inner loop.
+
+Expensive Z3 queries — array Store inside quantifier instantiation —
+cost the same per check either way, but their *count* is driven by
+the τ enumeration of the bundle they sit in.  The outer body's
+final-bundle constraint enumerates more atom-class combinations (the
+outer τ subsets × the inner abstract transition) than the inner
+inductive does (just the inner τ subsets); putting the Store outside
+the inner loop multiplies expensive checks by the outer τ size.
+
+**Concrete (selection sort vs. bubble sort)**: selection sort's
+τ_inner is 7 atoms, bubble sort's is 6 — almost identical.  But
+selection sort places the swap *after* the inner loop (in the outer
+body, where the running-min index is known), while bubble sort
+performs the conditional swap *inside* the inner loop.  Result:
+selection sort runs ~5 min, bubble sort ~6s.  Same correctness
+proof, ~50× wall-clock difference.
+
+If both placements are semantically equivalent, pick the bubble-sort
+shape.  If the algorithm genuinely requires the outer-body placement
+(e.g. selection sort, where the swap target is computed by the inner
+loop), keep τ_outer especially lean (REC 1 applies double).
+
+### REC 9 — Prefer single-int output for idiomatic C emission
+
+If the goal is shipping C source (Phase 5.A's `emit_c`), structure the
+problem so a single non-input `int` output is produced.  The emitter
+will then synthesize `int my_proc(...) { ... return out; }` —
+idiomatic and easy to consume.
+
+Other shapes still compile but are less natural:
+
+- **Multiple `int` outputs** or an `int` that is also an input → each
+  becomes an `int *<name>_out` parameter, written by store.
+- **Array outputs** stay in-place (arrays are already pointer-decayed
+  in the C ABI).
+
+Recursive templates also emit valid C (Phase 5.B) — see the C emitter
+section below for the recur-call output shape.  Iterative templates
+remain the most idiomatic C output, but recursion is no longer a
+blocker for the C deliverable.
+
+### REC 10 — Three-phase template for "find-witness" specs
+
+For specs of the form "return an index/witness `out` such that
+P(out, …) if a witness exists, else a sentinel value (`-1`,
+`None`)", the natural `Loop(SB(n>1))` with a found-flag pattern
+often fails the ranking-decrease check.  The framework's
+per-branch decrease fires unconditionally; the found-branch
+typically doesn't shrink ϕ (the loop is meant to exit via the
+AND-guard, not via ϕ).
+
+**Workaround**: a three-phase template
+`SB() >> Loop(SB(n=k)) >> SB(n=k')` —
+
+  - Phase 1 (`SB`): initialize state.
+  - Phase 2 (`Loop(SB(n=k))`): search **unconditionally** until
+    the window collapses.  Loop guard is purely structural
+    (`lo <= hi`, not gated on a found flag).  Every branch
+    strictly shrinks ϕ.
+  - Phase 3 (`SB(n=k')`): post-check the collapsed state to
+    decide the witness value (`idx := lo - 1 if A[lo-1] == x
+    else -1`).
+
+Worked example: `benchmarks/stretch/binary_search.py`.  τ_inner
+maintains "[0, lo) holds values ≤ x" and "(hi, n) holds values >
+x"; after loop exit, A[lo - 1] (if it exists) is the witness.
+
+If the witness check is non-trivial it can also be done with
+SB(n>1) — that's still a single bundle in our IR, no decrease
+issues.
+
+The "real fix" — POPL'10's vacuous-Fpre ranking refinement
+(Phase 3.J for recursion) extended to loops — is banked but
+not implemented.  Until then, 3-phase is the canonical
+workaround.
+
+### REC 12 — `_break` atom + find-flag + increment-at-start for nested-loop early exit
+
+For algorithms that search across NESTED loops and want to
+exit when a witness is found (e.g., augmenting-path search,
+BFS/DFS layer scans, Hopcroft-Karp-style nested search), the
+canonical encoding is:
+
+  1. **`_break: True` flag on the inner branch transition.**
+     The inner SB branch that detects the hit emits a
+     transition atom of the shape:
+
+     ```python
+     {"_break": True, "found": "1"}
+     ```
+
+     The break atom is allowed ONLY inside a Loop body.  The
+     framework emits a special "break-bundle" obligation in
+     place of the usual inductive: instead of preserving
+     τ_inner across the body, the break branch must establish
+     `τ_enclosing(body_out)` (when nested inside an enclosing
+     Loop) or `Fpost(body_out)` (top-level).
+
+  2. **`found` program variable, initialized to 0.**  Each
+     outer loop's guard includes `found == 0`.  Once the
+     inner break sets `found := 1`, the outer guard re-checks
+     and the outer loops exit naturally.
+
+  3. **Increment-at-start counter pattern.**  Initialize each
+     iterator to `-1` and increment in the enclosing body's
+     prep SB BEFORE the inner Loop runs.  This keeps the
+     inner Loop as the LAST item in its enclosing body chain
+     — so the break's consequent `τ_enclosing(body_out)`
+     doesn't need chain-tail composition (which is K.D.2.a
+     deferred).
+
+**Worked example** (`bench_aug3_two_loops.py`):
+
+```python
+outer_body = SB() >> Loop(SB(n=2))   # prep SB, then inner Loop
+
+template = SB() >> Loop(outer_body)   # init SB, then outer Loop
+# outer prep SB increments v and resets w to 0:
+#   {"v": "v + 1", "w": "0"}
+# outer loop guard: "v + 1 < n and found == 0"
+# inner loop guard: "w < n"
+# inner branch 0: matched -> {"_break": True, "found": "1"}
+# inner branch 1: no match -> {"w": "w + 1"}
+```
+
+The synthesized algorithm reads (paraphrased):
+
+```
+v, w, found := -1, 0, 0
+while (v + 1 < n and found == 0):
+    v, w := v + 1, 0
+    while (w < n):
+        if <hit>: found := 1; break
+        else:     w := w + 1
+```
+
+**Soundness scope** (K.D, 2026-05-25):
+  - Break is allowed only inside Loop bodies.  Break outside
+    a Loop is rejected at constraint generation.
+  - When the breaking Loop is nested inside an enclosing Loop,
+    the break-bundle consequent is `τ_enclosing(body_out)` —
+    the inner break exits to the enclosing loop's body, which
+    still must satisfy its invariant.  Top-level Loop break:
+    `Fpost(body_out)`.
+  - The enclosing Loop's abstract transition drops `¬g_inner`
+    for break-capable inner Loops — the inner exit may have
+    `g_inner` still true (early exit via break).  The Lean
+    chain-aware translator mirrors this (lesson #66).
+
+**Not yet supported (K.D.2.a)**: break in a Loop that is NOT
+the last item in its enclosing body's chain.  The break's
+consequent would need chain-tail composition between
+`body_out` and `τ_enclosing`.  Workaround: restructure the
+algorithm via increment-at-start so the inner Loop is last.
+
+### REC 13 — Fpre is propagated into inner constraints (K.D)
+
+As of Phase K.D, the framework propagates `Fpre` (the
+top-level pre-condition) into recursive `walk_template`
+calls.  Input variables don't change across loop iterations,
+so `Fpre` evaluated at any state where the input bindings
+are present equals `Fpre` at the initial state.
+
+**Practical consequence**: outer τ does NOT need to carry
+immutable input facts (e.g., `n >= 0`, `is_bipartite(G)`,
+matrix-dimension constraints) just so inner constraints can
+see them.  Inner inductives and bundle obligations now have
+Fpre available in their antecedents directly.
+
+This trims |τ_outer| (often by several atoms).  Before K.D,
+benchmarks routinely needed redundant τ atoms like `n >= 0`
+just to forward the precondition through nested loops; now
+those atoms are redundant.
+
+**Symptom of "missing input fact"** before K.D was an UNSAT
+or per-class-valid-but-globally-inconsistent verdict
+mentioning the input fact.  Post-K.D, this symptom is
+auto-fixed; if you see it persist, the issue is elsewhere
+(likely a genuine τ gap, not an Fpre routing gap).
+
+### REC 14 — Let the wedge detector surface missing helpers
+
+When authoring a new benchmark with `helper_registry`, do
+NOT try to enumerate every constraint that needs a Tier-3
+helper proactively.  Instead, run synth and let the
+**per-constraint wedge detector** (Phase K.D.W, 2026-05-25)
+surface them one at a time.
+
+**Workflow:**
+
+  1. Author the benchmark with the helpers you can predict
+     (typically the bundle-post for the algorithm's
+     correctness theorem).  Set `helper_registry=` with what
+     you have.  Leave the rest to be discovered.
+  2. Run synth.  If a constraint wedges, the detector prints
+     `[WEDGE] sc<N> (kind=..., loop_id=..., branch_idx=...):
+      K non-valid Lean dispatches; consider authoring a
+      Tier-3 helper ; inspect ls dump_dir/sc<N>_*.failed.lean`
+     and abandons enumeration at `2 × wedge_threshold` dispatches.
+  3. At end of run, if any constraints abandoned, the verdict
+     is `NoSolution(reason="needs-helpers")` with hints
+     listing each wedged constraint.
+  4. Inspect a sample `.failed.lean` dump for sc<N>, author
+     the Tier-3 helper, wire it into `helper_registry`, re-run.
+  5. Iterate until all constraints close.
+
+**Default `Problem.wedge_threshold = 30`** is calibrated so
+legitimate axiom-heavy benchmarks (fib, distributing
+hundreds of dispatches across many constraints, ~tens per)
+don't false-flag.  Set lower (e.g., `wedge_threshold=10`)
+when prototyping a new benchmark and you want fast feedback
+on which constraints need helpers.
+
+**Why this beats proactive enumeration**: predicting which
+of N nested-loop constraints will close generically vs need
+a helper is hard ahead of time — the answer depends on the
+exact τ atom set, the algorithm structure, and how Lean's
+generic tactic chain handles each `.failed.lean` shape.  The
+detector turns the question from "predict everything up
+front" into "iterate one constraint at a time, with the
+synth telling you which".
+
+K.3.2 full 3-nested validation (2026-05-25): the wedge
+detector caught a missing sc1 helper on the first run (60
+dispatches before abandonment); the second run with the
+added helper closed in 1466s.  6 Tier-3 helpers total.
+
+### REC 15 — Iteration-budget `k` for identity-args tail recursion (Slice 2.B)
+
+When a Recur template's `args` shape is IDENTITY (`args = {x:
+x, y: y, ...}` — every arg expression equals the corresponding
+input var name), the standard ranking-decrease obligation
+shape `phi(in_b) > phi(args_evaluated)` becomes
+`phi(in_b) > phi(in_b)` — i.e., `x > x`, always false.  The
+framework's constraint generator binds `in_b` to the
+procedure's loop-modified state, NOT the procedure-entry
+state, so phi can't see "I've made progress between procedure
+entry and the recur call".
+
+This bites tail-recursive algorithms where the loop body
+mutates state in-place and the recur is just "re-enter to do
+another round on the mutated state".  Maximum-matching's
+canonical shape is the prototypical example: AP search +
+flip on found-flag + tail-recur on the mutated `M`.
+
+**Workaround — explicit iteration budget `k`** (Slice 2.B
+2026-05-25):
+
+```python
+inputs = [..., Var("k", "int", "input")]
+pre = "... and k >= 0"
+
+# Recur branch's args.k = k - 1:
+atoms[<recur_branch_s>] = [{
+    "_recur": True,
+    "args": {..., "k": "k - 1"},
+    "ret": {...},
+}]
+atoms["phi@PROC"] = ["k"]
+
+# Optional guard on recur branch:
+atoms[<recur_branch_g>] = ["k > 0"]  # so args.k >= 0 satisfies Fpre
+```
+
+Now `phi(in_b) = in_b.k`, `phi(args) = in_b.k - 1`; decrease
+holds trivially.  Caller passes `k` as a safe upper bound on
+iteration count (e.g., `k = n / 2` for matching).
+
+**Validated by**: `bench_max_matching_recur.py` —
+synthesizes the canonical 3-nested AP + flip + tail-recur
+shape in 102s with `phi@PROC = k`, `k` an input bounded by
+`n / 2`.
+
+**Principled fix (deferred)**: track procedure-entry-state
+distinctly from in_b in the constraint generator, so phi
+can compare across the loop's modification of state.  Multi-
+day refactor; not blocking any currently-targeted benchmark.
+
+### REC 15.5 — Mod-cycled `k_left` budget for "no nested scan" iteration algorithms (Gale-Shapley)
+
+Some algorithms are naturally expressed as "while some
+condition X holds across the data, do a step Y" — e.g.,
+Gale-Shapley's "while some man is unmatched, propose".  The
+naive shape requires an inner scan to find an X-witness,
+which currently needs nested loops over the data with break
++ find-flag (REC 12) — workable but heavy.
+
+When the witness can be cycled deterministically through the
+candidate space, a cleaner encoding is **mod-cycled budget**:
+
+  1. Add an input `k_iter: int` — a safe upper bound on the
+     total number of iterations.  The caller supplies it
+     (`n*n`, `n*(n-1)`, etc., depending on the algorithm).
+  2. Add a local `k_left: int`, initialized to `k_iter`,
+     decremented every iteration.
+  3. Cycle the candidate index `m_cur := (m_cur + 1) mod n`
+     each iteration (or use whatever modular advance fits
+     your candidate space).
+  4. Each iteration's SB(n=k) body splits into SKIP
+     (candidate already done) / DO (candidate needs a step)
+     / continue (other algorithm branches) cases.  SKIP just
+     advances `m_cur` and decrements `k_left`.
+  5. The loop guard is `k_left > 0`.  `phi@L0 = k_left`
+     trivially decreases.
+
+**Validated by**: `bench_gale_shapley.py` (2026-05-28).
+Mod-cycled GS synthesizes in 86.1s with a 3-branch SB(n=3)
+body (SKIP / ACCEPT / REJECT) avoiding the inner free-man
+scan that the natural while-some-man-unmatched shape would
+need.
+
+**Tradeoff**: the iteration count is LOOSE (`k_iter` is an
+upper bound, not exact).  The synthesizer doesn't know "the
+last p iterations were all SKIPs because the algorithm
+terminated p iterations early".  In practice this is fine —
+correctness doesn't care about extra SKIPs, and the caller
+picks `k_iter` to be a safe over-estimate.
+
+**Win**: no new IR primitive (works within the existing
+SB / Loop / Recur surface).  Avoids the K.D.2.a chain-tail
+limitation entirely — the inner scan is fused into the
+outer loop's mod-cycled body.
+
+**When NOT to apply**: when the algorithm genuinely needs
+nested-loop-with-break semantics (e.g., the inner scan is
+not over a uniform candidate space, or its termination
+condition is non-trivial).  Gale-Shapley happens to fit the
+mod-cycle shape; not every algorithm will.
+
+Banked as lesson #77.
+
+### REC 15.6 — Recursive-UF equality as post for algorithm verification (Gale-Shapley)
+
+For algorithms whose specification is "the synthesized
+program computes the same answer as a reference
+implementation", the canonical encoding is:
+
+  1. Declare reference UFs that take all inputs + an
+     iteration index `k`:
+     `RefMate : (... inputs ...) → Int → (Int → Int)`.
+  2. Declare base axioms at `k = 0`:
+     `RefMate args 0 = <initial state>`.
+  3. Declare step axioms recursively at `k + 1`:
+     `RefMate args (k + 1) = <one step of the algorithm>`,
+     branching on the algorithm's iteration cases.
+  4. The post is a quantified equality between the
+     synthesized state and the UF evaluated at
+     `k_iter - k_left`:
+
+     ```python
+     post = ("ForAll(lambda mm: Implies(0 <= mm and mm < n, "
+             "M[mm] == RefMate(... inputs ..., k_iter - k_left)[mm]))")
+     ```
+
+  5. The τ on the outer loop carries this same equality
+     atom (load-bearing for inductivity).
+
+**Validated by**: Gale-Shapley (2026-05-28).  Uses three
+recursive UFs (`GSMate`, `GSWMate`, `GSNxt`) tracked over
+`k_iter - k_left` iterations.  6 Tier-1 helpers close
+each iteration's preservation in Lean from concrete `store`
+semantics + step axioms.  NO classical-theorem trust (the
+post is recursive-UF equality, NOT GS stability — the
+algorithm's stability follows from the recursive-UF
+definition, not from a classical-theorem axiom).
+
+**Why this beats axiomatic-post specs**: with a classical-
+theorem-style post (e.g., "M is a stable matching of (G,
+prefs)"), the per-iteration preservation theorems need to
+preserve a property that's defined abstractly — proof
+obligations require classical-theorem-level reasoning at
+each step.  With a recursive-UF-equality post, each step
+matches the corresponding UF step axiom mechanically; the
+preservation theorems can be proved by destructuring the
+concrete predicate and citing the relevant step axiom.
+
+**Cost**: more axioms in the trust surface (Gale-Shapley
+ships 17: 3 base + 1 structural + 13 step).  But each
+axiom is small and mechanical (defining the UF's
+semantics), and the headline trust gain is that ZERO
+algorithm-correctness axioms are needed — the algorithm
+IS correct by construction relative to the recursive UF.
+
+Banked as the load-bearing pattern for algorithm
+verification via recursive-UF step axioms.
+
+### REC 16 — Concrete IsMatching predicate is 4 atoms, not 3 (Slice 2.C)
+
+When concretizing a `IsMatching` UF (or any "M is a valid
+matching on G" predicate) into atomic τ-atoms instead of a
+UF, the minimum-correct atom set is **4**, not 3.  Each
+atom is conditional on `M[k] != -1` (vertex k is matched):
+
+  - **range**: `M[k] ∈ [0, n)`
+  - **symm**: `M[M[k]] == k`
+  - **no_self**: `M[k] != k`  ← load-bearing!
+  - **edge**: `G[k][M[k]] >= 1`
+
+Without `no_self`, the predicate admits `M[v] = v` — a
+self-matched vertex.  This breaks the AP-flip-preserves-IM
+proof: the case analysis assumes `{u, v, M v, w}` are 4
+distinct values, which requires `M v ≠ v`.  The 3-atom
+predicate (range / symm / edge) is *more permissive* but
+*unsoundly weak* for the flip-preservation theorem.
+
+**General lesson**: when converting a UF + axiom
+abstraction (where the axioms implicitly assume well-
+formedness) to a concrete predicate, audit which
+mathematical properties the UF's axioms *implicitly*
+required.  In Slice 2.B's `mm_flip_preserves_matching`
+axiom, `M[k] ≠ k` was implicit (matchings exclude
+self-loops by convention); concretizing made it explicit.
+
+**Pattern** (from `bench_max_matching_concrete.py`):
+
+```python
+_MI_RANGE = "ForAll(lambda kk: Implies(0 <= kk and kk < n and M[kk] != -1, 0 <= M[kk] and M[kk] < n))"
+_MI_SYMM  = "ForAll(lambda kk: Implies(0 <= kk and kk < n and M[kk] != -1, M[M[kk]] == kk))"
+_MI_NOSELF = "ForAll(lambda kk: Implies(0 <= kk and kk < n and M[kk] != -1, M[kk] != kk))"
+_MI_EDGE  = "ForAll(lambda kk: Implies(0 <= kk and kk < n and M[kk] != -1, G[kk][M[kk]] >= 1))"
+```
+
+Each is a SEPARATE τ atom (β-style splitting).  The
+framework picks partial subsets; helpers declare just the
+IM atoms they need via the minimal-required-atoms pattern
+(REC 17, Slice 2.C lesson #71/#75).
+
+**Tradeoff**: τ atom count inflates (Slice 2.C's τ@L2 is
+12 atoms = 4 IM + 8 other, vs Slice 2.B's UF-based 8 atoms).
+Per-subset enumeration is 2^12 = 4096 subsets — manageable
+only with minimal-required-atoms helpers.
+
+### REC 16.5 — Prefer Tier-1 proven theorems over Tier-2 axioms (authoring overlay for P-2)
+
+**Governing principle**: [`PRINCIPLES.md`](./PRINCIPLES.md)
+**P-2** — see there for the full rationale, acceptable
+Tier-2 carve-outs, and validation cases.
+
+**Authoring overlay** — what this means when you're writing
+a new benchmark's helpers:
+
+1. **Phase 1** — Stand up the helper as a Tier-2 `axiom` in
+   `Helpers.lean` (per REC 16 / Tier-2-first workflow).  Get
+   the E2E synth closing first.  This is fast (~5 LOC, minutes).
+2. **Phase 2** — Before declaring the benchmark "done,"
+   budget a focused session to promote each load-bearing
+   axiom to a Tier-1 theorem.  Per-helper cost calibration
+   (from Gale-Shapley 2026-05-28):
+     - Tier-1 theorem: 50-200 LOC, 1-4 hours of iteration in
+       scratch first (REC 1: scratch-first).
+     - Slice 2.C (~120 LOC for `flip_preserves_im`) and GS
+       (~270 LOC across ACCEPT + REJECT) were each half-day
+       investments.
+
+**What NOT to promote** (per P-2's acceptable Tier-2 list):
+  - Genuinely-classical theorems (Berge, GS stability,
+    König, Boyer-Moore dominance).
+  - Recursive-UF base + step axioms that DEFINE the UF's
+    semantics (e.g., `GSMate_base`, `GSMate_accept_step`).
+
+### REC 17 — FLAT vs chain-aware helper signature dispatch (Slice 2.C)
+
+Generalization of lesson #69.  Within a single benchmark,
+different helper signatures may need different binder
+shapes:
+
+  - **FLAT**: bare pre-state names (`n`, `M`, `u`) +
+    primed post-state for modified vars (`u'`, `M'`).
+  - **Chain-aware**: per-state binders (`n_s0`, `M_s1`,
+    `u_s2`) indexed by chain position.
+
+The rule: if the chain prefix to the constraint's target
+has only SB items (no Loops), FLAT.  Otherwise chain-aware.
+Same constraint kind in the same benchmark can be FLAT for
+some sc<N> and chain-aware for others.
+
+**Example from Slice 2.C** (`bench_max_matching_concrete.py`):
+
+  - **FLAT**: sc1 (safety-bundle-entry L0), sc6 (safety
+    step L2), sc14 (final bundle ⇒ post), sc15 (procedure
+    coverage).
+  - **Chain-aware**: sc2 (L1 entry after Loop L0 +
+    intermediate SB), sc3 (L2 entry), sc9 (L1 body
+    inductive via L2 abstract), sc11 (L0 body inductive
+    via L1 abstract).
+
+**Symptom of mismatch**: Lean's `unknown identifier`
+errors when the helper cite references binder names that
+aren't in the translator's emitted theorem.
+
+**Mitigation**: smoke-test each helper individually via
+`verify_class_via_lean(problem, chosen_atoms, sc_kind,
+loop_id)` before committing.  Inspect the theorem text
+via `theorem_for_<kind>(...)` if uncertain about the
+binder shape.  Slice 2.C's commits `ed43dd3` and `830c52c`
+were post-hoc sc1/sc6 helper signature fixes after
+`unknown identifier` surfaced in the synth log.
+
+### Procedure-level multi-branch SB(n>1) coverage (Slice 2.B fix)
+
+The framework supports a **procedure-level multi-branch
+SB(n>1)** (e.g., the final `SB(n=2)` of a `Loop() >> SB(n=2)`
+template — branching on the loop's exit state to decide
+return shape).  This emits a `coverage` constraint with
+`loop_id=None`.
+
+Pre-Slice 2.B (2026-05-25), axiom-heavy Lean dispatch
+filtered these out of routing because the standard
+`_extract_loop_id(sc) is not None` gate excluded them.
+Post-fix, procedure-level coverage routes to Lean dispatch
+when the benchmark has axioms.  No user-facing change beyond
+"it works now".
+
+If you use a procedure-level multi-branch SB(n>1) AND your
+benchmark has `axioms = [...]` (including the dummy `"0 == 0"`
+trick from CLAUDE.md's always-on reminders), expect Lean to
+close the coverage obligation.  Without axioms, Z3 closes it
+directly via LIA.
+
+---
+
+## Templates
+
+```python
+SB(n=k)           # k≥1 branches; each branch has its own guard + transition
+Loop(body)        # body is ANY Template (Phase 3.K)
+left >> right     # Seq; flattened by linearization
+Recur()           # recursive procedure call (atoms must be _recur-shaped)
+```
+
+Nested loops are supported: `Loop(Loop(SB))`, `Loop(SB >> Loop(SB) >>
+SB)`, etc.  The Loop's *abstract transition* (visible to outer
+bundles) is `τ_inner ∧ ¬g_inner ∧ frame_eqs`.  The frame eqs preserve
+every program var NOT in the body's modified-vars set (syntactic
+over-approximation: any var assigned in any atom of any block in the
+body).
+
+### Block-ID assignment ordering (F20, worked example)
+
+Block IDs (`B0`, `B1`, …) and loop IDs (`L0`, `L1`, …)
+are assigned by a single pre-order DFS over the template
+tree, with **separate counters** for each prefix.  Loop
+counters are independent from block counters.  Each SB
+gets one `B<k>` regardless of n; each branch within an
+SB(n>1) is referred to as `B<k>.<branch_idx>`.
+
+Worked example — `find_min_max_two_pass`:
+
+```python
+SB() >> Loop(SB(n=2)) >> SB() >> Loop(SB(n=2)) >> SB()
+```
+
+Pre-order walk + counter increments:
+
+| Node                     | Block / Loop ID | Notes |
+| ---                      | ---             | ---   |
+| top-level SB (init)      | `B0`            | first SB |
+| Loop (outer min loop)    | `L0`            | first Loop |
+| nested SB(n=2)           | `B1`            | branch hyps live at `s@B1.0`, `s@B1.1`; guards `g@B1.0`, `g@B1.1` |
+| top-level SB (mid-init)  | `B2`            | second SB |
+| Loop (outer max loop)    | `L1`            | second Loop |
+| nested SB(n=2)           | `B3`            | branches `B3.0`, `B3.1` |
+| top-level SB (exit)      | `B4`            | fifth SB |
+
+Hole IDs the framework produces:
+
+- `tau@L0`, `tau@L1`         (one per Loop)
+- `g@L0`, `g@L1`             (loop guards)
+- `phi@L0`, `phi@L1`         (ranking functions)
+- `s@B0`, `s@B2`, `s@B4`     (transitions of single-branch SBs)
+- `s@B1.0`, `s@B1.1`, `s@B3.0`, `s@B3.1` (per-branch transitions)
+- `g@B1.0`, `g@B1.1`, `g@B3.0`, `g@B3.1` (per-branch guards)
+
+If you're hand-authoring `chosen` dicts for
+`verify_class_via_lean` smoke tests, this mapping
+matters: a typo'd `s@B2` when the chain expected `s@B1`
+silently produces wrong-shaped binders in the dispatched
+theorem.
+
+---
+
+## Atom shapes
+
+### Transitions (`s@…`)
+
+```python
+# Parallel assignment.  RHS parsed against pre-state; vars not in
+# the dict are preserved.
+{"x": "x + 1", "y": "2 * y"}
+
+# SSA / sequential.  Later entries see earlier LHS values.  No
+# fresh Z3 names appear — intermediates inlined symbolically.
+[{"tmp": "x"}, {"x": "y"}, {"y": "tmp"}]
+
+# Array store via Update (Z3 Store).
+{"A": "Update(A, i, 0)"}
+
+# Two-element swap with no temp — outer Update reads original A.
+{"A": "Update(Update(A, j, A[j+1]), j+1, A[j])"}
+
+# Recursive call.
+{"_recur": True,
+ "args": {procedure_input_name: expr_over_pre_state, ...},
+ "ret":  {var_name: expr_over_call_outputs, ...}}
+
+# Break out of the enclosing Loop (Phase K.D, 2026-05-25).
+# Allowed ONLY inside a Loop body.  The break-bundle obligation
+# emits in place of the inductive: when nested under an
+# enclosing Loop, the break must establish τ_enclosing at
+# body_out; top-level Loop break must establish Fpost.
+# Extra dict keys are regular assignments performed alongside
+# the break (commonly a found-flag set: see REC 12).
+{"_break": True, "found": "1"}
+```
+
+### Predicates (τ, guards) — Python-expression strings
+
+Operators: `+ - * / and or not == != <= >= < >`.  (Do NOT use `&&`,
+`||`, `!`.)
+
+```python
+"x + y > 0"
+"A[k] == 0"
+"ForAll(lambda k: Implies(0 <= k and k < n, A[k] == 0))"
+"ForAll(lambda p, q: Implies(0 <= p and p <= q, A[p] <= A[q]))"
+"Exists(lambda k: A[k] == target)"
+```
+
+### Numeric (φ) — single-hot
+
+Each atom is an int-valued expression.  Decreasing across the loop
+body, bounded below by 0.
+
+```python
+"n - i"
+"n if n > 0 else 0"     # ternary OK (Phase 3.J clamped form)
+```
+
+### Cost (`cost@<lid>`) — single-hot, opt-in via `cost_target`
+
+When `Problem.cost_target: str` is set (default `None`), every Loop
+gets a `cost@<lid>` hole alongside `phi@<lid>`.  Candidate atoms are
+int-valued expressions bounding the loop's per-iteration cost
+contribution + nested-body cost (north star #1, see `COST_INVS.md`).
+
+```python
+PROBLEM = Problem(
+    ...,
+    cost_target = "n",
+    atoms = {
+        ...,
+        "phi@L0":  ["n - i"],
+        "cost@L0": ["n - i"],
+    },
+)
+```
+
+Three soundness-critical constraint kinds emit when `cost_target`
+is set:
+  - `cost-lb`: `Pre ∧ τ ⇒ cost@L(state) ≥ 0`.
+  - `cost-decrement`: per-iteration body cost ≤ `cost@L(in) -
+    cost@L(out)`.  For SB-bodied loops `body_cost = 1`; for non-SB
+    bodies a sum-over-items rule applies (`SB→1`, `Loop→
+    cost@L_inner(entry)`, `Recur→0` — deferred).
+  - `cost-budget` at the top level:
+    `Pre ⇒ cost@L0(pre_state) ≤ cost_target(input)`.
+
+All three are in `_REJECT_UNKNOWN_KINDS` (UNKNOWN is rejected, not
+silently accepted) and Lean-dispatchable via `theorem_for_cost_lb` /
+`theorem_for_cost_decrement[_chain]`.  The Lean side has access to
+`SynthLean.CostLemmas` (11 polynomial identities) via `open ... in`
+at proof time.
+
+**Tractability note.**  Linear cost expressions (`n - i`,
+`(n - i) * c` for constant `c`) dispatch in ms on Z3.  Quadratic
+expressions (`(n - i) * (n + 2)`, nested cost compositions) trip Z3's
+NIA solver — `bubble_sort_cost` pays ~28s in current encoding.  A
+heuristic that gates Lean-first dispatch on nonlinearity is banked
+(`COST_INVS.md` §2 follow-up) but not yet wired.
+
+**Worked benchmarks** in `benchmarks/cost_invs/`: `sumi_cost`,
+`array_zero_cost`, `mul_cost`, `max_array_cost`, `nested_cost`
+(O(n²)), `bubble_sort_cost`.  `sumi_cost_bad` is the negative-only
+test (invalid candidates → UNSAT).
+
+**Recur / SB(n>1) cost.**  `cost@PROC` (analog of `phi@PROC` for
+recursive procedures) and per-branch cost variation in SB(n>1) are
+NOT yet supported — every branch is currently assumed unit cost.
+Deferred to a later slice.
+
+### SB(n=k>1) — per-branch holes
+
+Each branch has its own guard and transition holes:
+
+```python
+"g@B<id>.0": [<guard candidates for branch 0>]
+"s@B<id>.0": [<transition candidates for branch 0>]
+"g@B<id>.1": [<guard candidates for branch 1>]
+"s@B<id>.1": [<transition candidates for branch 1>]
+...
+```
+
+Branches need NOT be orthogonal.  Coverage `⋁ g_i ≡ true` is
+auto-asserted as a well-formedness constraint.
+
+---
+
+## Tractability rules of thumb
+
+Per τ hole, the inductive constraint enumerates `2^|atoms|` subsets:
+
+| τ atom count | subsets | linear-arith τ | quantified + array Store τ |
+| --- | --- | --- | --- |
+| 3 | 8 | <1s | a few seconds |
+| 5 | 32 | seconds | tens of seconds |
+| 7 | 128 | tens of seconds | a few minutes |
+| 9+ | 512+ | minutes | hours / hangs |
+
+Multiple τ holes Cartesian-multiply.  Bubble sort (τ_outer 4 atoms,
+τ_inner 6 atoms) runs in ~6s because:
+
+- Inductive on τ_inner has all atoms in BOTH position — full 2^6 = 64
+  enumeration.
+- Every other constraint (entry, LB, decrease, final bundle, …) has
+  τ atoms in a single position, so Phase 3.L's monotonicity fast
+  path collapses each to a single check.
+
+The cost driver is therefore the inductive constraint.  Keeping the
+inner τ minimal (REC 1) is where the biggest gains live.
+
+Quantified atoms cost more per Z3 check than non-quantified — Z3
+instantiates universals against Store/Select patterns via E-matching.
+Multi-variable quantifiers (`∀p, q`) instantiate more option-pairs;
+bilateral atoms are still typically a win over splitting into two
+single-variable atoms because the *number* of atoms shrinks (REC 2).
+
+---
+
+## Avoiding circular axioms
+
+`problem.uninterpreted` + `problem.axioms` (Phase 3.D) are legitimate
+for:
+
+- **True external primitives** — library calls, network operations,
+  hardware operations the synthesizer cannot inspect.
+- **Compositional sub-procedures** — helper functions whose contract
+  (pre/post) is provided as a black box.  The synthesizer verifies
+  the outer program against the contract; the helper is itself
+  synthesized in a separate run.  (Assume-guarantee abstraction —
+  feature TBD.)
+
+NOT legitimate for:
+
+- **Anything the synthesizer can prove directly**.  Axioms that
+  "essentially state the answer" defeat the synthesis.  Example:
+  axiomatizing `merge(A, lo, mid, hi)` as "produces a sorted result"
+  to make mergesort succeed — off the table.  Bubble sort proves
+  sortedness can be synthesized without such crutches.
+
+---
+
+## Axiom-heavy obligations and Lean fallthrough
+
+For axiom-heavy problems (`uninterpreted` or `axioms` non-empty)
+on soundness-critical constraints, the synthesizer bypasses Z3
+entirely and routes every attribute-class check to Lean — first
+a fast cache lookup (`.solved.lean` / `.invalid.lean` companion
+keyed by signature hash), then Lean's generic tactic chain.  See
+`SOUNDNESS.md` for the full posture.
+
+### REC 11.4 — Lean dispatch's cold-cache trap (community-validation lesson)
+
+Every `lake env lean <tmpfile>` invocation that the synth's
+verify path spawns starts a fresh `lean` process.  Mathlib's
+~thousands of `.olean` files have to be loaded from disk on
+first call in a session — typically **10-15s** before any
+proof elaboration begins.  The per-class timeout in
+`synth/solver.py` is **15 seconds**.  Result: the **first**
+Lean dispatch in a fresh session almost always times out,
+regardless of how simple the proof obligation is.
+
+**Symptoms**:
+- Every `.failed.lean` dump's first line says
+  `-- TIMED OUT after 15.0s`.
+- The wedge detector fires after ~30 timeouts on the same
+  constraint; synth returns `NoSolution(reason="needs-helpers")`.
+- Re-running the benchmark hits the same trap (fresh process
+  each time → cold mathlib each time).
+
+**Prevention** (in order of robustness):
+1. **Pre-warm the cache via `lean/setup.sh`** (community-
+   validation fix F1, 2026-06-08).  Setup script now runs a
+   one-time `lake env lean` to populate the OS page cache.
+   If you haven't run setup recently, run it now.
+2. **Pre-build your new Helpers** before invoking synth:
+   `cd lean && lake build SynthLean.Y2Corpus.<bench>.Helpers`
+   makes the .olean available so the dispatch's import is
+   instant rather than re-elaborating.
+3. **Run a benchmark THAT IS KNOWN TO DISPATCH LEAN first**
+   in the session before running your new one — e.g.,
+   `python benchmarks/fib.py` once warms mathlib for the
+   current shell process tree.  Then your fresh benchmark
+   benefits from the warm cache.
+4. **Prefer the `.solved.lean` companion path over the
+   HelperRegistry path** for first-time authoring — see
+   "REC 11.6 .solved.lean companions vs HelperRegistry"
+   below.  `.solved.lean` companions are dispatched via
+   signature-hash cache lookup, bypassing the cold-mathlib
+   load entirely on cache hit.
+
+**What to do if you hit the trap mid-synth**: don't iterate
+proofs against the failed dumps; the failure is timeout,
+not unsound.  Pre-warm first, then resume.
+
+**Cold cache vs steady-state enumeration treadmill (F16,
+community-validation 2026-06-08)**: the cold-cache trap
+above is a **one-time** 10–15s tax on the first dispatch
+in a process.  After mathlib is loaded, subsequent
+dispatches are 1–3s each on cache hits.  But for
+axiom-heavy benchmarks with large τ, **the steady-state
+wall-clock is dominated by per-subset Z3 enumeration**,
+not Lean proof time.  Concretely: τ of N atoms produces
+up to 2^N partial subsets; each is dispatched to Lean's
+generic tactic chain with a per-class budget (currently
+adaptive — see "F16 adaptive timeout" in
+`synth/solver.py`).  Partial-τ subsets that lack
+load-bearing atoms are genuinely unprovable and **will**
+return UNKNOWN; the framework treats UNKNOWN as
+"potentially valid" (subset to other constraints'
+filters) by default.  Don't be surprised when a single
+MEDIUM axiom-heavy benchmark takes 5–10 min of mostly
+Z3-side enumeration — this is normal.  If you want to
+shorten the wall-clock, the lever is **shrinking τ**
+(REC 1) rather than tuning Lean tactics.
+
+**`.failed.lean` dumps from partial-τ enumeration are
+EXPECTED, not actionable** (F17, community-validation
+2026-06-08).  During enumeration the framework dispatches
+many partial-τ subsets per constraint.  Most of them are
+provably-incomplete (missing load-bearing atoms) and will
+fail.  Each failure dumps a `sc{N}_fallthrough_<hash>.failed.lean`
+file.  **The signature of an actionable failure** is a
+dump whose τ binder list matches the FULL τ atoms for
+that loop — those are the ones that block global SAT.
+Partial-τ dumps (fewer `h_tau_*` binders than `len(problem.atoms["tau@<lid>"])`)
+are noise.  To distinguish at a glance, the dumper
+adds a `_partialN_` infix to partial-τ filenames (vs no
+infix for full-τ).  Grep `sc7_fallthrough_*.failed.lean`
+without `_partial` to see only the actionable failures.
+
+### REC 11.6 — `.solved.lean` companions vs `HelperRegistry`
+
+Two authoring paths exist for Tier-3 helpers:
+
+**Path A — `.solved.lean` companions** (cache-based):
+- Synth runs, dumps `<bench>/<stem>.failed.lean` per failed
+  per-class obligation.
+- You write `<bench>/<stem>.solved.lean` next to it with the
+  same theorem signature + a real proof body.
+- Synth's cache lookup finds it by signature hash and
+  bypasses Lean dispatch.
+- No `SynthLean.lean` import required — companions are
+  resolved by file path, not module name.
+- **Most robust path for first-time authoring** — bypasses
+  the cold-cache trap, no import to forget, easy to add
+  proofs one-at-a-time.
+
+**Path B — `HelperRegistry` + `Helpers.lean` module**:
+- You write `Helpers.lean` with named theorems.
+- You register `HelperEntry` per (kind, loop_id, branch_idx)
+  in the benchmark file.
+- Synth's codegen module cites the helper via `exact <name>`.
+- **REQUIRES** adding `import SynthLean.Y2Corpus.<bench>.Helpers`
+  to `lean/SynthLean.lean` (load-bearing — synth's dispatch
+  resolves the helper via module name, not file path).
+- Cleaner when multiple benchmarks share the same proof
+  pattern.  More brittle for one-off benchmarks.
+
+**Recommendation**: start with Path A.  Promote to Path B
+when you have ≥2 benchmarks that would share the same
+helper theorem.
+
+(Community-validation finding F4, 2026-06-08: 3 of 5
+test agents who chose Path B stalled on the cold-cache
+trap or the missing-import requirement; the 1 agent who
+chose Path A completed in 147s.)
+
+### REC 11.8 — `.solved.lean` imports should prefer `SynthLean.Core` over `.Basic`
+
+When writing a `.solved.lean` companion, **start with
+`import SynthLean.Core` instead of `import SynthLean.Basic`**.
+The `Core` module contains the synthesizer's array primitives
+(`store`, `store2d`) without pulling mathlib; `Basic` re-exports
+Core PLUS mathlib's `Mathlib.Tactic` (for `linarith`, `aesop`,
+`decide`, etc.).  Mathlib's overhead per typecheck is
+**~2.6× slower** (5.3s vs 2.0s for a trivial `rfl` proof,
+measured 2026-06-08).  Under multi-agent / multi-dispatch
+contention, this is the difference between hitting the 15s
+per-class budget and blowing it.
+
+**Use Core if your proof only needs**: `omega`, `subst`,
+`refine ⟨...⟩`, `rw`, `exact`, `have`, `intro`, `cases`,
+`simp [user_axiom_*, store, store2d]` (no mathlib lemmas
+in the simp set).
+
+**Escalate to Basic if you need**: `linarith` (mathlib;
+nonlinear), `nlinarith`, `aesop`, `decide`, `polyrith`,
+`mathlib.*` lemma citations, mathlib `Int`/`Nat` tactics
+beyond `omega`'s coverage.
+
+Most simple recursive-UF proofs (the workhorse pattern for
+`sum_array`-style benchmarks) need only `subst_eqs`,
+`refine`, `omega`, and `exact (user_axiom_N args).symm` —
+all Core-compatible.
+
+(Community-validation finding F6, 2026-06-08: the corpus
+was bulk-migrated to Core where possible — 128 of 223
+`.solved.lean` files now on Core, ~7 benchmarks needed
+mathlib tactics and stayed on Basic.  Author your new
+`.solved.lean` files Core-first; downgrade to Basic only
+when a proof step requires it.)
+
+### REC 11.7 — UF-complexity ceiling: even small UF changes can flip dispatch outcomes
+
+The generic Lean tactic chain
+(`omega | nlinarith | aesop | simp_all [user_axiom_*]`)
+closes some axiom-heavy entry-bundle obligations
+(`sc0_*`) without a hand-authored helper.  But this
+coverage is **fragile** — a small change to the UF
+signature can flip the obligation from "tactic chain
+closes" to "needs a Tier-3 helper."
+
+**Concrete data point (community-validation P1, 2026-06-08)**:
+- `sum_array` (corpus) defines `sum : (Int → Int) → Int → Int`
+  with recurrence `sum(A, k+1) = sum(A, k) + A[k]`.  Its
+  sc0 (entry-bundle) obligation `0 = sum(A, 0)` closes via
+  the generic chain (aesop unfolds `user_axiom_0`
+  symmetrically).
+- `sum_of_squares` (new benchmark) defines `sqsum` with
+  the same shape but per-step term `A[k] * A[k]`.  The
+  sc0 obligation `0 = sqsum(A, 0)` has the **same**
+  structure, but the generic chain **wedged** — needed an
+  sc0 helper:
+  ```lean
+  theorem sc0_helper : ... := (user_axiom_0 A).symm
+  ```
+- The 1-line difference in UF per-step term (`A[k]` vs
+  `A[k] * A[k]`) was enough to push the tactic chain out
+  of its sweet spot, even though the obligation structure
+  is identical.
+
+**Implication for authors**: if your UF signature is even
+slightly richer than the closest corpus reference's UF
+(extra Int args, multiplicative per-step term, nested UF
+applications, etc.), **plan to author an sc0 helper
+upfront** rather than waiting for the tactic chain to
+close it.  The minimum sc0 helper is one line of Lean
+(`exact (user_axiom_0 args).symm`) and saves the dispatch
+churn of waiting for tactic-chain timeouts.
+
+The reach of the generic tactic chain is **not monotone in
+UF complexity** — there's no clean rule for "this UF will
+close, that one won't."  Empirical: write the helper, even
+if the reference benchmark didn't need one.
+
+**REC 11.7.A — sc0 entry-bundle UF cliff** (F14,
+community-validation 2026-06-08): the sc0 entry-bundle
+obligation is the **sharpest** instance of REC 11.7.
+When your benchmark's entry-bundle τ contains a UF
+application equation like `result = sum(A, 0)` or
+`s = summax(A, B, 0)`, the sc0 obligation is essentially
+"derive `0 = sum(A, 0)` from `user_axiom_0 : sum(A, 0) = 0`",
+which requires SYMMETRIC rewriting that
+`omega`/`nlinarith` cannot do.  The generic `simp_all`
+fallback CAN handle it, but only after mathlib loads
+(cold-cache trap, REC 11.4) — and `simp_all` on UF
+axioms is often the slowest tactic in the chain.  Result:
+sc0 frequently hits the per-class timeout on the very
+**first** dispatch, with no other constraint having warmed
+the cache.
+
+**Rule of thumb**: if your entry-bundle τ contains any
+UF application equation (not pure linear arith), author
+the sc0 `.solved.lean` companion from day one.  The
+helper is one line: `exact (user_axiom_0 args).symm`.
+The framework now emits a warning hint when sc0 times
+out on a benchmark whose entry-bundle includes a UF
+application (see `synth/solver.py` "F14 sc0 UF cliff"
+detection).
+
+### REC 11.5 — Gate τ atoms about "next" values on the relevant bound
+
+When a τ atom asserts a property about an array read at a
+"next" index (e.g., `C[i+j-1] <= A[i]` after the current step
+emits at position `i+j-1` and the next A element will be `A[i]`),
+GATE the implication on the bound (`i < n`) so the atom is
+vacuously true at the boundary where `i = n`.
+
+**Wrong** (boundary unprovable from is_sorted):
+```python
+"Implies(i + j > 0, C[i + j - 1] <= A[i])"
+```
+
+**Right** (vacuous at i = n):
+```python
+"Implies((i + j > 0) and (i < n), C[i + j - 1] <= A[i])"
+```
+
+**Why this matters.**  `is_sorted(A, n) = 1` only constrains
+A[0..n-1].  The ungated atom requires `C[i+j-1] <= A[n]` at the
+boundary state `i = n` (after the loop's last step or at exit) —
+not derivable.  A focused boundary axiom (`is_sorted A n = 1 →
+A (n-1) ≤ A n`) closes the gap but adds a Tier-2 axiom.  Gating
+the τ atom eliminates the need for the axiom entirely.
+
+**No information is lost** at non-boundary states: when the loop
+body executes, the branch guard already gives `i < n`, so the
+gated antecedent reduces to the ungated one.  Gating only
+matters at the boundary, where the atom becomes vacuous.
+
+**Banked**: merge_two_sorted (2026-05-19).  v7 used the ungated
+atom + 2 focused boundary axioms (`merge_array_boundary_A/B`).
+v8 gated the atoms and eliminated both boundary axioms;
+proofs became simpler (no boundary case-split).  Net: 6/7
+Tier-1 helpers for merge with 0 boundary axioms.
+
+The pattern generalizes: any τ atom about a "next" array
+element should be gated on the corresponding bound.
+
+### REC 11 — Encode array-property universals via UFs + axioms, not direct quantifiers in τ
+
+When the spec needs a universal-quantified property of an array
+(e.g., sortedness `∀r,s. r ≤ s < n → A[r] ≤ A[s]`, or
+"every-element-≤-best"), DO NOT put the `ForAll(...)` directly
+in a τ atom.  Encode the universal as a recursive UF + axioms.
+
+Why:
+  - **Triggers the codegen path.**  Without UFs/axioms,
+    `_axiom_heavy_lean_path = False`, so the synth stays on
+    Z3-only.  Z3 with quantified τ atoms can wedge on
+    quantifier instantiation, producing no output at all.
+  - **Helper short-circuit fires.**  With UFs in scope, the
+    H.2.CODEGEN dispatch path engages; if the benchmark
+    registers a HelperRegistry, the full-τ subset hits the
+    fast path.
+  - **Lean handles UF recurrences well.**  `omega` ignores
+    UFs; `simp` rewrites via axiom-1 (the recurrence) cleanly;
+    aesop can chain rewrites.  Quantifier-free τ atoms keep
+    each per-class Lean check ≤ 5s.
+
+**Pattern**:
+
+  ```python
+  # Wrong (direct quantifier in τ):
+  pre = "ForAll(lambda r, s: Implies(0 <= r and r <= s and s < n, A[r] <= A[s]))"
+  atoms = {"tau@L0": [
+      "ForAll(lambda r, s: Implies(0 <= r and r <= s and s < i, C[r] <= C[s]))",
+      ...
+  ]}
+  # Right (UF + axioms; τ atoms quantifier-free):
+  uninterpreted = [("is_sorted", ["int[]", "int"], "int")]
+  axioms = [
+      "is_sorted(A, 0) == 1",
+      "is_sorted(A, 1) == 1",
+      ("ForAll(lambda k: Implies(k >= 1, "
+       " is_sorted(A, k + 1) == "
+       " (1 if (is_sorted(A, k) == 1 and A[k - 1] <= A[k]) else 0)))"),
+      # ... per-array (B, C, ...) since IR doesn't support
+      # typed lambda bindings.
+  ]
+  pre = "is_sorted(A, n) == 1 and is_sorted(B, p) == 1"
+  atoms = {"tau@L0": [
+      "is_sorted(C, i + j) == 1",
+      ...
+  ]}
+  ```
+
+The Boolean UF returns Int 0/1 because the IR doesn't have a
+Bool sort for UFs.  Compare with `== 1` everywhere.
+
+**Per-array axioms**: the IR's lambda quantifier binds vars as
+`Int` (no `int[]` lambda parameters).  Workaround: write a
+separate axiom set for each program array (A, B, C, ...).
+Three axioms × three arrays = nine axioms for merge_two_sorted's
+sortedness — verbose but works.
+
+**Banked**: kadane (`sum_range`), majority (`count_eq`), modular_exp
+(`pow`), and merge_two_sorted (`is_sorted`) all use this
+pattern.  Direct-quantified-in-τ encodings DO wedge Z3 (see
+merge_two_sorted's history — pre-rewrite synth produced zero
+output in 10 min; post-rewrite reached Lean dispatch and
+produced diagnostic dumps).
+
+Direct quantifiers in τ ARE acceptable for posts/pres where
+the spec is the universal itself AND you intend to keep the
+benchmark on the Z3 path (no UFs).  This is rare in practice —
+almost any universal over array properties is better as a UF.
+
+**Sound by default.**  All five axiom-heavy benchmarks (`fib`,
+`factorial`, `sum_array`, `array_product`, `count_zeros`) now
+synthesize under `potentially_unsound = False`.  The chain-bundle
+Lean translator + curated `.solved.lean` cache cover the
+recurrence-axiom obligations Z3 couldn't handle reliably.
+
+**Authoring a new axiom-heavy benchmark:**
+
+1. Write the `Problem` with `uninterpreted`, `axioms`,
+   `dump_lean_failures_dir = "lean/SynthLean/Y2Corpus/<bench>"`.
+   The path is **CWD-relative** (resolved at Problem
+   construction; `__post_init__` normalizes to abspath and
+   logs the resolved location to stderr).  Run benchmarks
+   from the repo root (or worktree root) — running from a
+   subdir silently writes dumps + cache hits to the wrong
+   place.  See SETUP.md §6 for the CWD invariant.
+   (F19, community-validation 2026-06-08.)
+2. Run synthesis under sound default.  Likely returns
+   `NoSolution` with `.failed.lean` dumps in the dir.
+3. Inspect each dump.  For each one (signature hash from filename):
+   - If the τ subset is genuinely valid but Lean's generic chain
+     can't close it → write `<stem>.solved.lean` with a
+     mathlib-tactic proof.
+   - If the τ subset is genuinely insufficient → write
+     `<stem>.invalid.lean` proving `∃ vars, hyps ∧ ¬ goal` with
+     concrete witnesses.
+4. Verify with `tests/test_y2corpus.py` (runs `lake env lean`
+   on every companion).
+5. Re-run synthesis → SolveResult.
+
+The `Problem.potentially_unsound` field exists as a documented
+dev escape hatch (no committed benchmark sets it; the production
+code path it gated is dead).  `expected_lean_hits: int | None`
+is informative regression telemetry (not strict — Z3
+nondeterminism makes per-class hit counts non-portable).
+
+### Helper-axiom strategy for `.solved.lean` curation
+
+For axiom-heavy benchmarks (modular_exp, kadane, majority, …),
+the user-supplied UF axioms are sometimes insufficient to close
+an obligation in Lean **even though the proof obligation is
+mathematically valid** — the missing fact is derivable from the
+stated axioms by induction, but the induction itself is heavy
+to write inline.
+
+**Two-phase Tier-2-first authoring workflow** (banked
+2026-05-19; CLAUDE.md "Always-on reminders"):
+
+1. **Axiomatize first.**  Write the helper as `axiom <name> :
+   <signature>` in `Helpers.lean`.  Wire the citation + register
+   the HelperEntry.  Smoke-test `verify_class_via_lean` to
+   confirm the citation type-checks.  Run E2E to confirm the
+   benchmark synthesizes.  This decouples "does the helper
+   short-circuit work end-to-end" from "is the math actually
+   provable".
+2. **Prove the theorem second.**  Promote the `axiom` to a
+   `theorem` with an explicit proof.  Build to confirm Lean
+   accepts the proof; re-smoke-test that the citation still
+   fires.  The axiom is gone; trust is now from a proof.
+
+Each phase has a cheap exit criterion, so you can revert
+cleanly at any point.  This avoids two failure modes:
+(a) wasting proof-engineering effort on a helper whose
+citation doesn't even type-check (translator-vs-axiom binder
+mismatch); and (b) shipping a benchmark "verified" via an
+unprovable axiom.
+
+**Tier classification (current as of 2026-05-20):**
+
+For curated `.solved.lean` shims that cite a helper from
+`Helpers.lean`, the helper itself has three trust modes:
+
+1. **Tier-1 (theorem from user axioms).**  Proved from user
+   recurrence axioms by short induction.  Example:
+   `modular_exponentiation/Helpers.lean` proves
+   `pow_mod_base : pow x k % m = pow (x % m) k % m` by
+   `Int.le_induction` over k ≥ 0 (~15 lines).  Used to
+   complete `modexp_branch0/1_preserves_inv` as full
+   theorems (no remaining axioms).
+
+2. **Tier-2 (focused boundary / pre-condition axiom).**  Tiny
+   axiom isolating a gap in the user's spec.  Example
+   (eliminated 2026-05-19 via IR-level fix): merge's
+   `merge_array_boundary_A/B` — A[n-1] ≤ A[n] from
+   `is_sorted A n = 1`.  Eliminated by gating τ atoms 5/6
+   on `i<n`/`j<p` (REC 11.5).
+
+3. **Tier-2 (algorithmic-correctness ceiling).**  Named axiom
+   capturing a classical algorithm-correctness result that
+   the user's τ atoms alone don't imply, AND that requires
+   IR-level work to promote.  Examples:
+     - `boyer_moore_dominance` (majority_element) — requires
+       algorithm-trace induction with a strengthened invariant
+       beyond what τ can express.
+     - `merge_l2_entry_chain` (merge_two_sorted) — chain-aware
+       abstract Loop transition doesn't preserve C across the
+       L1 boundary; the conclusion needs relational propagation
+       the translator doesn't yet emit.
+     - `sp_self_nonneg` (floyd_warshall) — encodes the
+       non-negative-cycles Pre assumption; not algorithmic.
+
+**When to use it.**
+- The obligation is genuinely valid (the math is sound).
+- The missing fact is **derivable** from the stated axioms.
+- Inline induction would be substantial (multi-page Lean).
+- The benchmark's purpose is to demonstrate the END-TO-END
+  pipeline, not to be a Lean tutorial.
+
+**When NOT to use it.**
+- The obligation is genuinely invalid (write `.invalid.lean`
+  with a mechanically-verified existential counterexample).
+- The missing fact is non-trivial mathematically (don't paper
+  over real theorems).
+- The "fact" is actually false under the user's intended
+  semantics (e.g., truncating vs. Euclidean mod).
+
+First worked example: modular_exponentiation's odd-branch
+inductive needs `pow_mod_base` (pow respects modular reduction).
+See
+`lean/SynthLean/Y2Corpus/modular_exponentiation/sc2_fallthrough_1abd942a.solved.lean`.
+
+**Helper-axiom trust tiers (banked 2026-05-17).**  The curation
+of majority_element surfaced a second mode of helper-axiom use.
+The tiers, in increasing trust burden:
+
+1. **Tier 1 — Local derivable lemma.**  Helper states a fact
+   directly provable from the user's axioms by induction or
+   case-split.  Example: `pow_mod_base` (modular_exp): `pow (x %
+   m) k % m = pow x k % m` follows from axioms 0/1/3 by `k`
+   induction.  The proof inline would be ~30 lines; the helper
+   axiom is a documented shortcut.
+
+2. **Tier 2 — Inductive-step encapsulation.**  Helper IS an
+   inductive step that the user's τ-atom set + axioms can't
+   carry through.  The fact is mathematically valid (the
+   algorithm is correct) but requires reasoning OUTSIDE the
+   user's stated invariant.  Example: `bm_inv_preserve_b0/b1`
+   (majority_element): the Boyer-Moore invariant `cnt +
+   count_eq(A, i, candidate) ≥ count_eq(A, i, v)` doesn't
+   preserve under the branch transitions using only the user's
+   axioms — the classical proof needs to track "cnt as lead
+   since last adoption", which isn't expressible as a single
+   τ-atom in our IR.  Tier-2 helpers ARE the proof obligation,
+   stated at a higher level of abstraction.
+
+**When you find yourself reaching for Tier 2**, that's a signal:
+**the user's τ atoms are too weak to be self-inductive**.
+Banking the helper means the corpus is "Lean-checked modulo the
+algorithm being correct".  A future revision should either:
+(a) enrich τ with stronger atoms that make the inductive
+self-contained, OR (b) prove the helper via a richer auxiliary
+invariant (e.g., add "cnt-since-adoption" as a ghost variable).
+
+**Tier-2 honesty.**  Always document Tier-2 helpers as such in
+the .solved.lean's docstring.  A reviewer can distinguish "this
+is a local lemma I trusted by induction" from "this is the
+whole inductive correctness claim" by reading the header.
+
+**Codegen for repetitive proofs (banked 2026-05-17).**  When N
+.solved.lean files share a structural template (only varying in
+which τ-subset goal conjuncts are present), a Python script
+generating the files from a parameterized template is the right
+move.  See `scratch/majgen.py` for the pattern used to generate
+12 of 16 majority_element companions from 12 declarations.
+Hand-writing each invites copy-paste drift; the generator
+canonicalizes the proof structure.
+
+### Tier-3 helpers: one algorithm-correctness theorem per benchmark
+
+For benchmarks where many τ-subset variants of the SAME
+obligation kind (typically bundle-post) share an underlying
+algorithm-correctness theorem, write ONE Tier-3 helper file
+and have each shim `.solved.lean` cite it.  This is the
+canonical Tier-3 pattern banked in `RESEARCH.md §H.1`.
+
+**File layout (per benchmark):**
+
+```
+lean/SynthLean/Y2Corpus/<bench>/
+  Helpers.lean                # Tier-3 helpers (theorems / axioms)
+  sc<N>_fallthrough_<H>.solved.lean   # shim: cites a helper
+  sc<N>_fallthrough_<H>.failed.lean   # auto-dumped by synth
+  sc<N>_fallthrough_<H>.invalid.lean  # for genuinely-invalid τ
+```
+
+**Helpers.lean skeleton:**
+
+```lean
+import SynthLean.Basic
+open SynthLean
+
+axiom user_uf : Int → Int        -- user's UF declaration
+axiom user_axiom_0 : ...          -- user's axioms, re-declared
+                                  -- so the helper file is self-
+                                  -- contained.
+-- Optional: a documented trust-point axiom if the proof
+-- depends on an algorithmic fact that the user's τ atoms
+-- don't capture (see boyer_moore_dominance in
+-- majority_element/Helpers.lean).
+axiom <classical_result_name> : ...
+
+namespace SynthLean.<BenchName>Helpers
+
+theorem <kind>_from_inv
+    (... user vars ...)
+    (h_pre : <pre>)
+    (h_tau_<i> : <atom i>)        -- one per required τ atom
+    ...
+    (h_not_g : ¬ <loop guard>) :  -- for bundle-post kinds
+    <goal> := by
+  ...  -- proof body, possibly citing axioms
+
+end SynthLean.<BenchName>Helpers
+```
+
+**Three trust levels for the helper proof:**
+
+1. **Pure Tier-1 (best).**  Proof body uses only user
+   axioms; no `axiom` declarations beyond the user's UF.
+   Example: `kadane_max_subarray/Helpers.lean` —
+   `kadane_post_from_inv` follows from the user's
+   best-upper-bound atom evaluated at i = n.
+
+2. **Tier-1 with derived helper LEMMA (theorem, not axiom).**
+   A separate theorem proves an intermediate fact derivable
+   from user axioms by induction.  Example:
+   `modular_exponentiation/Helpers.lean` proves
+   `pow_mod_base : pow x k % m = pow (x % m) k % m` by
+   `Int.le_induction` over k ≥ 0 (~15 lines).  Branch helpers
+   then cite this lemma + user axioms.  All 4 modexp/kadane
+   per-step helpers are now Tier-1 (2026-05-19).
+
+3. **Tier-2 classical-result axiom.**  Named axiom capturing
+   a classical algorithm-correctness result the user's τ
+   atoms don't capture.  Example:
+   `majority_element/Helpers.lean` uses
+   `boyer_moore_dominance` (Boyer-Moore 1981's MJRTY
+   correctness).  Such ceilings are not promotable without
+   strengthening the user's τ or extending the IR; document
+   the ceiling in `Helpers.lean` and `BENCHMARKS.STATUS.md`.
+
+**Always prefer (1).**  Reach for (2) when inline induction
+is too heavy; write the intermediate as a separate `theorem`,
+not an `axiom`.  Reach for (3) only when (1) and (2) genuinely
+require a classical result outside the user's τ formulation,
+and document the ceiling.
+
+**Why prefer named axioms over `sorry`:**
+
+- `sorry` is a HOLE — Lean's linter flags it; corpus tests
+  could be configured to fail on its presence.  Future
+  Lean tooling may also treat sorry-bearing proofs as
+  unsound.
+- `axiom <name>` is an explicit assumption — named, grep-able,
+  documented in the file's docstring.  A replacement Lean
+  proof can land later without touching downstream shim
+  files.
+
+**Importing into the lake build:** ⚠️ LOAD-BEARING
+
+> **REQUIRED FIRST STEP after writing `Helpers.lean`** — without
+> this the synthesizer's helper-citation codegen path will
+> silently fail with `unknown identifier <helper_name>` errors
+> on every dispatch, and your synth run will timeout-wedge on
+> Lean dispatches that can't find the helper module.  This is
+> the most common HelperRegistry-path footgun
+> (community-validation finding F2, 2026-06-08: 2 of 3 agents
+> who chose the HelperRegistry path missed this step).
+
+Each Helpers.lean file must be imported from `lean/SynthLean.lean`
+so it builds into the `.olean` cache and is importable from
+shim `.solved.lean` files:
+
+```lean
+-- lean/SynthLean.lean
+import SynthLean.Y2Corpus.<bench>.Helpers
+```
+
+Then run `cd lean && lake build SynthLean.Y2Corpus.<bench>.Helpers`
+to populate the `.olean`.  After that, `lake env lean <shim>.solved.lean`
+calls find the helper's `.olean` and the shim type-checks.
+
+`synth/lean_backend/codegen.py` emits a warning if your
+benchmark sets `helper_registry` on its `Problem` but the
+corresponding `SynthLean.lean` import is missing.  Heed the
+warning before running synth.
+
+**Shim file pattern:**
+
+```lean
+import SynthLean.Basic
+import SynthLean.Y2Corpus.<bench>.Helpers
+
+open SynthLean
+
+namespace SynthLean.VerifyTmp
+
+set_option linter.unusedVariables false in
+theorem sc<N>_fallthrough
+    (... same signature as the .failed.lean dump ...) :
+    <goal> := by
+  exact SynthLean.<BenchName>Helpers.<helper_name>
+    <vars> <hyps in helper's order>
+
+end SynthLean.VerifyTmp
+```
+
+For modular_exp's full-τ sc7 sample, the entire shim is ~40
+lines; the proof body is one 4-line `exact ...` call.
+Compare to Tier-1 hand-curation at ~110 lines per file.
+
+**When NOT to use a Tier-3 helper:**
+
+- The obligation kind only has ONE τ-subset variant (rare —
+  the PLDI'09 enumeration usually produces many).  Just
+  hand-write one .solved.lean.
+- The user's τ atoms are TRULY too weak and no classical
+  result rescues them — write `.invalid.lean` with a
+  mechanically-checked existential counterexample instead.
+
+### §H.2 codegen helper-citation path (preferred over .solved.lean shims)
+
+After landing helpers in `Helpers.lean`, wire them into the
+benchmark's `Problem.helper_registry` so the synth's solver
+cites them directly (a one-line `exact <helper> <args>` proof
+body) instead of materializing per-subset `.solved.lean`
+shims.  Per-call cost drops 30-60s (generic tactic chain)
+→ ~2-5s (cached `.olean` + single-term type-check).
+
+The codegen module (`synth/lean_backend/codegen.py`) carries
+STRUCTURAL plumbing only — signature derivation + citation
+glue.  It does NOT write proofs.  Helpers carry the math;
+codegen carries the citation.
+
+**Per-benchmark wire-up:**
+
+```python
+from synth.lean_backend.codegen import HelperEntry, HelperRegistry
+
+
+def _cite_<helper>(chosen, hyp_for):
+    """Build the proof body for the helper citation."""
+    # Required τ atoms get hyp names via hyp_for(hole_id, orig_idx);
+    # returns `h_tau_<position>` matching the translator's binders.
+    h_a = hyp_for("tau@L0", 1)   # original atom-index 1 → its h_tau_N name
+    h_b = hyp_for("tau@L0", 4)
+    return (
+        "exact SynthLean.<BenchName>Helpers.<helper_name> "
+        f"<var args, primed if loop-modified> {h_a} {h_b} h_not_g"
+    )
+
+
+_HELPER_REGISTRY = HelperRegistry(
+    module_path="SynthLean.Y2Corpus.<bench>.Helpers",
+    entries=[
+        HelperEntry(
+            helper_name="<helper>",
+            applies_to=(lambda sc_kind, loop_id, branch_idx:
+                        sc_kind == "safety-bundle-post" and loop_id == "L0"),
+            required_atoms={"tau@L0": frozenset({1, 4})},
+            cite=_cite_<helper>,
+        ),
+        # ... one HelperEntry per (sc_kind, branch) ...
+    ],
+)
+
+
+PROBLEM = Problem(
+    ...,
+    helper_registry=_HELPER_REGISTRY,
+)
+```
+
+**Cite lambda subtleties:**
+
+- **Primed names**: the translator primes loop-modified vars
+  (e.g., `i'`, `best'`).  Pass primed names for vars that the
+  loop modifies; unprimed for inputs.  Branches that DON'T
+  modify a var keep it unprimed in the conclusion — adjust
+  the helper signature to match.
+- **Pre destructure**: when the helper's signature splits Pre
+  into multiple conjuncts (e.g., `h_pre_n + h_pre_maj`), the
+  cite must emit `obtain ⟨h_pre_n, h_pre_maj⟩ := h_pre\n  ` as
+  a setup line before the `exact`.  See
+  `_cite_majority_post_from_inv`.
+- **Branch-specific binders**: for `safety` kind, the
+  translator's primed-var set is the BRANCH's modified vars,
+  NOT the union.  Branch 1 may have FEWER primed binders than
+  branch 0 — write separate cite lambdas per branch.
+- **FLAT vs chain-aware dispatch (lesson #69)**: at L0
+  level, `verify.py` dispatches chain-bundle-post to
+  `theorem_for_chain_bundle` (FLAT — pre-loop vars unprimed,
+  post-loop primed) NOT `theorem_for_chain_bundle_chain`
+  when L0's chain prefix has no non-SB items.  Helper
+  signatures must match the actual translator output.  When
+  authoring an L0-level final-bundle helper, emit the
+  theorem with the translator first and copy binder names
+  exactly.  K.3.2 3-nested's `k32_3l_final` had to be
+  reshaped from chain-aware `_sN` binders to FLAT (pre/post)
+  before the cite type-checked.
+
+**Helper short-circuit (solver.py):**
+
+When `helper_registry.find(...)` returns a HelperEntry for a
+constraint AND the chosen FULL-τ subset matches the entry's
+`required_atoms`, the solver dispatches ONE Lean call instead
+of enumerating 2^|τ| subsets.  On valid: emit the full-τ
+cube; skip per-subset enumeration entirely.
+
+**Soundness**: each emitted cube is helper-proved (no
+over-generalization to "all subsets valid" — that's the
+unsound H.2.PROTOTYPE direction).
+
+**Completeness tradeoff**: smaller τ subsets that ALSO would
+have validated are skipped.  The synthesized solution carries
+the full τ atom set — score not minimized.  Per-atom helpers
+(future work) restore score-minimization.
+
+**Minimal-required-atoms pattern (Slice 2.B, lesson #71):**
+When a helper's proof needs only 1-2 τ atoms (not the full
+subset), declare `required_atoms` as just that minimal subset.
+Per-subset enumeration then fires the helper on EVERY τ
+subset containing those atoms — not just the full-τ cube.
+
+Example from `bench_max_matching_recur.py`:
+`mm_sc15_coverage` proves the RHS `g@B4.0 ∨ g@B4.1 =
+(found==1) ∨ (found==0)` from τ@L0 atom 2 (`found ∈ {0,1}`)
+alone via `exact h_tau_2.symm`.  Declaring
+`required_atoms = {"tau@L0": frozenset({2})}` enables the
+helper to fire on all 2^(|τ@L0|-1) subsets containing atom 2,
+eliminating 8 partial-subset UNKNOWNs that would otherwise
+sound-mode-reject.
+
+**General rule**: write the helper proof to use the fewest τ
+atoms possible (helpers should answer "what does THIS
+conclusion need?"); the `required_atoms` declaration should
+reflect that minimum.  Without this discipline, helpers
+short-circuit only the full-τ cube; partial subsets fall
+through to generic Lean, often timing out into UNKNOWN →
+sound-mode rejection → global SAT UNSAT.
+
+**Detection signal**: solver hints emit "Helper coverage:
+X/Y dispatches".  If coverage is low (<30%) and the benchmark
+UNSATs despite the helper closing the full-τ cube, you have
+partial-subset gaps — restrict `required_atoms` to the
+minimum the helper actually needs.
+
+**Routing in solver.py:**
+
+- `_AXIOM_HEAVY_DISPATCH_KINDS = {safety, safety-bundle-entry,
+  safety-bundle-post, coverage}`.  These kinds always go
+  through Lean dispatch when the benchmark has axioms.
+- `ranking-lb` and `ranking-decrease` STAY ON Z3.  Putting
+  them on Lean caused kadane/modexp wall-clock blowup from
+  Lean process contention — they're linear arithmetic, Z3
+  handles them in ms.
+- `coverage` is NEW (§H.2 fix for majority): Z3's quantifier
+  instantiation could UNKNOWN-reject the full-τ coverage cube
+  via UF-axiom interference.  Lean's `omega`/`decide` closes
+  coverage proofs reliably regardless.
+
+**E2E timings with H.2.CODEGEN wiring:**
+
+| Bench            | Before          | After    | Speedup |
+| ---              | ---             | ---      | ---     |
+| kadane           | 600s timeout    | ~70s     | 8.5×    |
+| majority         | UNSAT (1487s)   | ~3min    | works   |
+| modexp           | 1800s timeout   | ~70s     | 25×     |
+| merge_two_sorted | wedge (translator gap) | ~2min | works   |
+
+### Chain-aware translator (task #167, 2026-05-19)
+
+For benchmarks with **chained loops** (e.g.,
+`SB >> Loop(L0) >> Loop(L1) >> Loop(L2)` in merge_two_sorted)
+or **nested loops** (e.g., FW's `Loop(Loop(Loop(...)))`), the
+bundle-entry / bundle-post translator emits a **chain-aware**
+theorem when the chain contains non-SB items OR the target is
+nested inside an enclosing loop.
+
+Dispatch (in `synth/lean_backend/verify.py`):
+```python
+_path = _linearize_path(problem.template, loop_id)
+chain, target_idx, enc_lid = _path
+_use_chain = any(not isinstance(it, SB) for it in chain[:target_idx]) \
+             or enc_lid is not None
+```
+
+When `_use_chain=True`:
+- `theorem_for_entry_bundle_chain` emits per-state binders
+  (`<var>_s<k>` for k=0..target_idx) plus per-item hypotheses
+  (SB → trans + frame; Loop → τ_inner + ¬g + frame).
+- `theorem_for_chain_bundle_chain` emits the full chain
+  (target_idx+1 abstract trans) ending at the final post.
+
+**Cite-side**: helpers for chain-aware obligations must use
+the `<var>_s<k>` naming explicitly for state-bound vars
+(hyp_for doesn't expose per-state names).  See
+`_cite_merge_l1_entry_chain` etc. for the pattern.
+
+For τ-atom hypotheses, the translator binds them under
+DIFFERENT prefixes depending on role:
+
+  - `h_tau_<pos>` — the CURRENT loop's τ atoms in flat-shape
+    theorems (most safety / ranking obligations).
+  - `h_enc_tau_<pos>` — the ENCLOSING loop's τ atoms in
+    chain-aware bundle obligations on a NESTED loop.
+  - `h_i<k>_<lid>_tau_<pos>` — a Loop item appearing at
+    chain position `k` in a chain prefix (one of the items
+    threaded by `_emit_chain_item_hyps`).
+
+Use `hyp_for(hole_id, orig_idx, role=...)` to derive these
+without hardcoding (F11 — community-validation 2026-06-08):
+
+```python
+hyp_for("tau@L0", 2)                               # h_tau_<pos>
+hyp_for("tau@L0", 2, role="enc")                   # h_enc_tau_<pos>
+hyp_for("tau@L1", 0, role="chain", chain_k=1)      # h_i1_L1_tau_<pos>
+```
+
+The Q3 community-validation agent had to hardcode all three
+prefixes because they weren't documented; the role API was
+added in response.
+
+**Lean reserved words and UF names** (F12): the dispatched
+theorem uses your UF name literally, so a UF named after a
+Lean 4 keyword (`match`, `matches`, `with`, `where`, `do`,
+`let`, `in`, `class`, `where`, `theorem`, `axiom`, `def`,
+etc.) will fail to parse.  `Problem.__post_init__` now
+raises `ValueError` on construction if a UF name collides;
+rename to a safe alternative (`hits` instead of `matches`,
+`cls` instead of `class`, etc.).
+
+**Smoke-test gotcha**: when smoke-testing `verify_class_via_lean`
+on a chain-aware obligation, `chosen_atoms` MUST include
+`s@<init_block>` (the SB init transition) — otherwise the
+translator omits the init's trans hypotheses (emits frame eqs
+instead), producing different binder names than what the
+cite expects.  Also: `expand(problem)` must run before
+`verify_class_via_lean` so `Loop.loop_id` fields are
+populated (otherwise `_linearize_path` returns None).
+
+**When NOT to use the codegen path:**
+
+- Benchmark has no `helper_registry` configured — falls back
+  to today's generic tactic chain + `.solved.lean` cache.  No
+  regression.
+- Helper's signature changes — bumping required_atoms
+  invalidates current cite lambdas; treat as a breaking
+  change.
+
+---
+
+## What's verified
+
+**Canonical catalog: [`BENCHMARKS.STATUS.md`](./BENCHMARKS.STATUS.md).**
+Per-benchmark tiered listing (foundational loops, Phase X
+batches, stretch, cost-bound, open-problem) with path,
+verifier, V/S count, wall-clock, helper tier, discoveries,
+and caveats.
+
+### Reference benchmarks by structural pattern
+
+When authoring a new benchmark, look up the closest pattern
+below and start from those reference benchmarks (`benchmarks/
+<name>.py`).  Each row lists existing exemplars + the
+distinctive feature their atom shape demonstrates.
+
+| Pattern | Reference benchmarks | What the atom shape demonstrates |
+| --- | --- | --- |
+| Single loop, scalar invariants | `intsqrt`, `sumi`, `mul`, `intdiv`, `bresenham*` | Quadratic / bilinear invariants |
+| Acyclic (no loop) | `swap`, `strassen`, `swap_first_last`, `array_swap` | SSA, polynomial identity, nested Updates |
+| SB(n=2) conditional | `abs`, `sat_sub`, `abs_diff`, `max2` | Branch coverage constraint |
+| SB(n=3) | `max3`, `mid3`, `scalar_clamp`, `sign`, `saturate_add` | 3-way branching |
+| SB(n=4) | `scalar_max4`, `scalar_min4` | 4-way branching |
+| Loop + SB(n=2) with quantified bounds | `max_array`, `array_max_val`, `array_min_val`, `min_array`, `min_index`, `array_max_index`, `min_max_pair`, `max_min_diff` | Witness-existential + bound atoms |
+| Loop with array write, prefix invariant | `array_zero`, `array_fill`, `array_copy`, `range_init`, `range_init_offset`, `array_set_const`, `array_increment_at` | Quantified prefix invariant |
+| Element-wise transform (cond.) | `add_arrays`, `subtract_arrays`, `linear_combination`, `pairwise_max`, `array_double`, `negate_array`, `increment_array`, `clamp_array_positive`, `clamp_array_range`, `abs_array` | Pointwise transformations with optional branching |
+| Recur | `rec_const`, `rec_neg`, `rec_zero_array`, `rec_zero_array_branched`, `rec_zero_array_chain`, `rec_zero_double` | Per-procedure ranking, vacuous-Fpre dodge |
+| Nested loops (no array) | `nested_loop`, `nested_zero_array` | Phase 3.K frame preservation |
+| Nested + conditional swap | `bubble_sort`, `insertion_sort` | Bilateral quantified sortedness post |
+| Early-exit loop | `find_first_pos`, `array_index_of` | Parametric / sentinel search |
+| Two-pointer / right-to-left scans | `array_concat`, `array_rotate_left`, `array_shift_right`, `reverse_array` | Loop + nested Updates |
+| Flag-fold loop | `all_positive`, `is_sorted` | Predicate-as-int output |
+| Outer-body swap | `selection_sort` (slow, ~5 min) | Sortedness post with non-body modification |
+| UF recurrences (axiom-heavy, slow) | `fib`, `factorial`, `sum_array`, `array_product`, `count_zeros`, `count_equal`, `dot_product`, `sum_first_k`, `array_neg_count`, `gcd`, `power_of_two` | Curated `.solved.lean` per benchmark |
+| Trivial / smoke | `last_element`, `abs2` | API smoke tests |
+| L1.6 max-matching (algorithm verification) | `bench_max_matching_concrete` (131.9s), `bench_gale_shapley` (86.1s) | Recursive-UF step axioms + Tier-1 helpers; classical-theorem trust (Berge) or zero (GS) |
+| Stretch (edge of tractability) | `kadane_max_subarray`, `modular_exponentiation`, `majority_element`, `fib4`, `fibfib` | Tier-3 helper-citation codegen + chain-aware translators |
+
+For authoring NEW benchmarks, the **hash CLI** (`python -m
+synth.lean_backend.hash benchmarks/<bench>.py [--tau ...]`)
+prints every `(sc_idx, kind, branch_idx, hash, filename)`
+tuple — use this when curating `.solved.lean` companions.
+
+---
+
+## C source emitter (Phase 5.A + 5.B)
+
+The synthesizer can now turn a `Solution` + `Problem` into compilable
+C function text:
+
+```python
+from synth import emit_c
+c_source = emit_c(solution, problem, fname="my_proc")
+```
+
+The output is a single C function with a header comment carrying the
+pre/post and the synthesized proof annotations (τ, φ, guards).  Ten
+benchmarks are tested through `clang -Wall -Werror` compile + sample
+runtime check (with a 15s runtime timeout to catch unsound infinite
+loops): `intsqrt`, `sumi`, `intdiv`, `abs`, `array_zero`,
+`bubble_sort`, `max_array`, `rec_const`, `rec_neg`, `rec_zero_array`.
+
+**Supported features:**
+
+- `int` and `int[]` parameters and locals.
+- `while` loops with proof-comment headers.
+- `if / else if / ... / else if` chains for `SB(n>1)`.  Note: there
+  is no implicit `else` — every branch is an explicit guard, since
+  coverage `⋁ g_i ≡ true` is a synthesizer-side proof obligation that
+  the C compiler can't see.  Locals assigned only inside branches are
+  default-initialized so clang's flow analysis is happy.
+- Parallel assignment (with the temp-dance for cross-referenced LHS
+  like swap), SSA-list assignment.
+- Array `Update` chains, including the nested `Update(Update(A, j,
+  A[j+1]), j+1, A[j])` swap idiom.
+- Return-value vs out-pointer ABI chosen from output shape (see
+  REC 9).
+- **`Recur` templates** (Phase 5.B).  Three output shapes:
+  - **Single int return, identity ret** → `result = fname(args);`.
+  - **Single int return, transforming ret** → `int _r_result =
+    fname(args); result = <transform>;`.
+  - **Array in-place (output is also an input)** → `fname(args);`
+    followed by any ret-side post-processing (Update chains emit as
+    array writes).
+  Every recursive call site is wrapped in `if (<Fpre@args>) { ... }`
+  so pure `~`-style templates (top-level `Recur()` with no explicit
+  base case) terminate at runtime.  The synthesizer's vacuous-Fpre
+  trick (REC 7) proves correctness only when the IH fires on
+  Fpre-satisfying args; the runtime Fpre guard makes that real in C.
+  This is transparent to the template author — supply the Recur atom
+  as usual; the wrap is added by the emitter.
+- **Mixed-output recur sites** (e.g. multiple int outputs through a
+  single recursive call) fall back to a TODO comment and are not
+  emitted.  Restructure to single-int-return or array-in-place.
+
+**Not supported by the emitter:**
+
+- Rust emitter (Phase 5.D, deferred).
+
+---
+
+## Python source emitter (Phase 5.C)
+
+```python
+from synth import emit_py
+py_source = emit_py(solution, problem, fname="my_proc",
+                    runtime_check=False)   # default
+py_source = emit_py(solution, problem, fname="my_proc",
+                    runtime_check=True)    # self-checking
+```
+
+Output is a single Python function with type hints, the same proof-
+comment style as `emit_c`, and idiomatic Python where it differs
+from C:
+
+- Tuple assignment for swap-style transitions: `x, y = y, x` (no
+  temp-dance needed; Python's parallel-assignment is native).
+- `A[i] = v` for array `Update`; tuple form `A[j], A[j+1] = A[j+1],
+  A[j]` for the nested-Update swap idiom.
+- All int outputs are returned (Python passes ints by value), so a
+  procedure with two int outputs returns `tuple[int, int]` even if
+  one of them shares a name with an input.
+- Array outputs that are also inputs: in-place modification (no
+  return).
+
+**`runtime_check=True`** lowers every proof obligation into an
+executable check against `synth.proof_runtime`:
+
+| Obligation | Emitted call |
+| --- | --- |
+| Pre at function entry           | `proof_pre(<expr>, "...")` |
+| Post at function exit           | `proof_post(<expr>, "...")` |
+| Loop invariant at body top + exit | `proof_invariant(<expr>, "...")` |
+| Loop ranking decrease           | `_phi_prev = <φ>` at body top, `proof_decrease(<φ>, _phi_prev, "...")` at body end |
+| Loop ranking lower bound        | `proof_lower_bound(<φ>, "...")` |
+| SB(n>1) branch coverage         | `proof_coverage(<g_0>, <g_1>, ..., message="...")` before the if/elif chain |
+
+Each call raises `synth.proof_runtime.ProofViolation` (an
+`AssertionError` subclass) with the structured `(kind, message,
+details)` on failure.
+
+**Quantified atoms** (`ForAll(lambda <vars>: Implies(<bounds>, <body>))`
+and `Exists` analogues) are translated to `all(...) / any(...)`
+comprehensions with **over-iteration plus the antecedent as a
+filter** — every quantified variable iterates over `range(0, UB)`
+where `UB` is inferred from any `<var> < <expr>` or `<var> <=
+<expr>` clause in the antecedent.  This is O(UB^|vars|), more than
+strictly needed, but always correct.  Atoms with no inferrable
+upper bound degrade to a `# runtime check skipped` comment.
+
+**Runtime-check is also a soundness oracle.**  If the synthesizer
+ever picks an unsound `phi` (the example we've hit: `phi = i`
+chosen over `phi = n - i` due to Z3-UNKNOWN-conservative-acceptance
+under quantifier load), the runtime decrease check fires
+immediately on execution.  This is more reliable than catching
+soundness gaps via Z3 alone.  When debugging unexpected behavior
+from a synthesized program, switching to `runtime_check=True` and
+running on a sample input is the first thing to try.
+
+---
+
+## Not yet supported
+
+- **Assume-guarantee sub-procedure contracts** (a `_call` atom shape
+  similar to `_recur` but for an external named helper with its own
+  pre/post).  Deferred until a benchmark needs it.
+- **Mixed-output recur call sites** (multiple non-array outputs
+  through one recursive call) — emitter leaves a TODO comment.
+  Restructure the procedure shape if you hit this.
+- **Rust source emitter.**  Phase 5 follow-on in `DESIGN.md`.
+- **`continue` inside loops.**  `break` is supported via the
+  `_break: True` atom flag (REC 12).  `continue` (skip to next
+  iteration) is not yet plumbed.
+- **Break in a non-last chain position.**  K.D.2.a deferred —
+  break in a Loop that is NOT the last item in its enclosing
+  body's chain.  Workaround: restructure via increment-at-start
+  so the inner Loop is last (REC 12).
+- **Mutually recursive procedures**.
+
+---
+
+## Upkeep
+
+After each phase finishes in `CLAUDE.md`, this file should be
+refreshed via the routine documented in CLAUDE.md's
+"Phase-completion routine" section.  The goal is to keep this file
+audience-focused: an LLM authoring `(template, predicates, spec)`
+inputs needs to know what to TRY and what to AVOID, not the
+synthesizer's implementation history.

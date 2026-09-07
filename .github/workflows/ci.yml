@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Allow re-runs without queueing extras for the same branch + event.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Budget breakdown (typical):
+    #   Lean install:               ~3 min
+    #   Quick regression:           ~12 min (sum_array via Lean
+    #                                       parallel dispatch ~3 min)
+    #   Python + C + Rust emitters: ~12 min
+    #   Lean backend tests:          ~5 min
+    #   Y2 corpus mechanical-check:  ~5 min
+    # Total ~37 min in original budget — but post-H.4 with several
+    # benchmarks taking 5-10 min each (reverse_array ~9 min,
+    # array_rotate_left ~6 min, array_shift_right ~2 min,
+    # sum_array ~2 min, array_concat ~40s), the regression suite
+    # alone is ~20-25 min on CI (slower than dev machine).  Bumped
+    # to 90 to give cloud-noise headroom; if CI again hits the
+    # cap, the right fix is to gate slow benchmarks behind --slow
+    # rather than further bumping the timeout.
+    timeout-minutes: 90
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Skip Git LFS fetching — none of the LFS-tracked files
+          # (PDFs, pins-src binaries under ref/) are needed for the
+          # tests, and skipping saves bandwidth + LFS bandwidth quota.
+          lfs: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install package + deps
+        run: |
+          python -m pip install --upgrade pip
+          # Editable install picks up the z3-solver dependency from
+          # pyproject.toml plus lets the tests import `synth` as a
+          # package.
+          pip install -e .
+
+      - name: Verify clang is available
+        run: clang --version
+        # ubuntu-latest comes with clang pre-installed; verify
+        # explicitly so a missing-toolchain failure is clearly
+        # labelled.
+
+      - name: Verify rustc is available
+        run: rustc --version
+        # ubuntu-latest comes with rustup pre-installed; verify
+        # explicitly so a missing-toolchain failure is clearly
+        # labelled.
+
+      # Lean must install BEFORE the regression because axiom-heavy
+      # benchmarks (`sum_array` in quick suite + fib/factorial/
+      # array_product/count_zeros in slow suite) rely on the Lean
+      # backend for soundness — without it, `lean_available()`
+      # returns False, the chain-bundle bypass doesn't fire, and
+      # those benchmarks UNSAT under sound mode.
+      #
+      # Lean 4 isn't pre-installed on ubuntu-latest.  leanprover/
+      # lean-action installs the toolchain pinned in
+      # lean/lean-toolchain and runs `lake build`.
+      - name: Lean backend build
+        uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: lean
+
+      # Step order: fail-fast guards before broad tests.
+      - name: No production `potentially_unsound = True`
+        run: |
+          # All committed benchmarks must synthesize SOUND.  This
+          # guard catches accidental opt-ins.  The Problem field
+          # itself remains as a dev escape hatch (see SOUNDNESS.md),
+          # but the production code path is dead.
+          if grep -rn 'potentially_unsound[[:space:]]*=[[:space:]]*True' benchmarks/; then
+            echo "FAIL: at least one benchmark sets potentially_unsound = True"
+            echo "All committed benchmarks must be sound by default."
+            exit 1
+          fi
+          echo "OK: no benchmark opts into potentially_unsound"
+
+      - name: proof_runtime unit tests
+        run: python -u tests/test_proof_runtime.py
+
+      - name: Quick regression suite
+        run: python -u tests/regression.py
+
+      - name: Python emitter tests (exec + runtime check)
+        run: python -u tests/test_emit_py.py
+
+      - name: C emitter tests (compile + run)
+        run: python -u tests/test_emit_c.py
+
+      - name: Rust emitter tests (compile + run)
+        run: python -u tests/test_emit_rust.py
+
+      - name: Lean backend tests (synthesize + translate + lake build)
+        # End-to-end: synthesize an obligation, translate to Lean via
+        # synth.lean_backend.translate, write to lean/SynthLean/
+        # Generated.lean, run `lake build`.  This is the "does the
+        # generated theorem actually compile" guard.
+        run: python -u tests/test_lean_backend.py
+
+      - name: Y2 corpus mechanical-check
+        # Every `.invalid.lean` / `.solved.lean` under
+        # `lean/SynthLean/Y2Corpus/` is a curated companion to an
+        # auto-dumped `.failed.lean`.  Companions encode mechanically
+        # verifiable claims (existential counterexample for invalid,
+        # direct proof for solved); this step runs `lake env lean` on
+        # each to enforce that the claim still type-checks under the
+        # current toolchain.  Drift between failed.lean and its
+        # companion (e.g., the translator's encoding shifts) fails
+        # here.
+        run: python -u tests/test_y2corpus.py

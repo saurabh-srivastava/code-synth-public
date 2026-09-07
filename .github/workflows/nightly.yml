@@ -1,0 +1,103 @@
+name: Nightly slow regression
+
+on:
+  # Daily at midnight UTC.
+  schedule:
+    - cron: '0 0 * * *'
+  # Allow manual triggering so we don't have to wait until midnight
+  # to validate workflow changes.
+  workflow_dispatch:
+
+# Separate concurrency group from the main CI so nightly runs do
+# not cancel push-CI and vice versa.
+concurrency:
+  group: nightly-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  slow-regression:
+    # Budget breakdown (typical, per CLAUDE.md slow-suite notes):
+    #   Lean install:                       ~3 min
+    #   Quick-suite benchmarks (50+):       ~12 min
+    #   Slow benchmarks (axiom-heavy):
+    #     fib                                ~7 min
+    #     selection_sort                     ~6 min
+    #     factorial                          ~8 min
+    #     array_product                      ~7 min
+    #     count_zeros                       ~26 min (longest single)
+    #   Python + C + Rust emitter tests:    ~12 min
+    #   Lean backend tests:                  ~5 min
+    #   Y2 corpus mechanical-check:          ~5 min
+    # Total expected ~100 min.  Start at 240 min (4 hours) to
+    # absorb cold-cache + cloud noise; ratchet down once observed.
+    timeout-minutes: 240
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Skip Git LFS fetching — none of the LFS-tracked files
+          # (PDFs, pins-src binaries under ref/) are needed for the
+          # tests, and skipping saves bandwidth + LFS bandwidth quota.
+          lfs: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install package + deps
+        run: |
+          python -m pip install --upgrade pip
+          # Editable install picks up the z3-solver dependency from
+          # pyproject.toml plus lets the tests import `synth` as a
+          # package.
+          pip install -e .
+
+      - name: Verify clang is available
+        run: clang --version
+
+      - name: Verify rustc is available
+        run: rustc --version
+
+      # Lean must install BEFORE the regression because axiom-heavy
+      # benchmarks (`sum_array` in quick suite + fib/factorial/
+      # array_product/count_zeros in slow suite) rely on the Lean
+      # backend for soundness.  See ci.yml for the full rationale.
+      - name: Lean backend build
+        uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: lean
+
+      - name: No production `potentially_unsound = True`
+        run: |
+          if grep -rn 'potentially_unsound[[:space:]]*=[[:space:]]*True' benchmarks/; then
+            echo "FAIL: at least one benchmark sets potentially_unsound = True"
+            echo "All committed benchmarks must be sound by default."
+            exit 1
+          fi
+          echo "OK: no benchmark opts into potentially_unsound"
+
+      - name: proof_runtime unit tests
+        run: python -u tests/test_proof_runtime.py
+
+      - name: Slow regression suite (quick + axiom-heavy)
+        # Includes fib, selection_sort, factorial, array_product,
+        # count_zeros in addition to the full quick suite.
+        run: python -u tests/regression.py --slow
+
+      - name: Python emitter tests (exec + runtime check)
+        run: python -u tests/test_emit_py.py
+
+      - name: C emitter tests (compile + run)
+        run: python -u tests/test_emit_c.py
+
+      - name: Rust emitter tests (compile + run)
+        run: python -u tests/test_emit_rust.py
+
+      - name: Lean backend tests (synthesize + translate + lake build)
+        run: python -u tests/test_lean_backend.py
+
+      - name: Y2 corpus mechanical-check
+        run: python -u tests/test_y2corpus.py

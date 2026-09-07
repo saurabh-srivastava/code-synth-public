@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+title: "Synthesizer: a clean-room reimplementation of Pragna (POPL'10 + PLDI'11)"
+message: "If you use this software, please cite it as below."
+type: software
+authors:
+  - family-names: Srivastava
+    given-names: Saurabh
+    email: s@saurabh-srivastava.com
+license: GPL-3.0-or-later
+repository-code: "https://github.com/saurabh-srivastava/code-synth"
+abstract: >-
+  A proof-theoretic synthesizer (predicate-abstraction over
+  VS3-PA) that consumes (control-flow template, predicate
+  space, English spec) and produces (code, proof).  Source
+  emitters for Python, C, and Rust; Z3 + Lean dual
+  verification backends.  Clean-room reimplementation of the
+  Pragna synthesis line (POPL'10 + PLDI'11).
+keywords:
+  - program-synthesis
+  - verification
+  - predicate-abstraction
+  - lean4
+  - z3
+  - vs3-pa

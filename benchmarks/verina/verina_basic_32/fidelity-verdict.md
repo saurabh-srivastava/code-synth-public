@@ -1,0 +1,11 @@
+# SpecGen fidelity — verina_basic_32
+
+VERINA's own test-based spec soundness/completeness check (specgen_check.py) on the ported spec vs VERINA's concrete tests:
+
+```
+[FIDELITY OK] verina_basic_32_swap_first_last
+  pre  soundness    OK 4/4
+  pre  completeness OK 1/1
+  post soundness    OK 4/4
+  post completeness OK 12/12
+```

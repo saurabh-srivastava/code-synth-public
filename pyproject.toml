@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "synth"
+version = "0.1.0"
+description = "Proof-theoretic program synthesizer (POPL'10 + PLDI'11 line)"
+requires-python = ">=3.10"
+dependencies = ["z3-solver"]
+
+[tool.setuptools.packages.find]
+include = ["synth*"]

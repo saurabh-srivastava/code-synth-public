@@ -1,0 +1,44 @@
+# Rust
+target/
+Cargo.lock
+
+# Reference unzipped pins/src
+ref/pins-src/
+
+# Lean
+lean/.lake/
+# Phase Y.2 corpus auto-dumps are committed (they're the INPUT side
+# of training pairs).  Curated companion files (.solved.lean /
+# .invalid.lean) live alongside them.  See
+# lean/SynthLean/Y2Corpus/README.md.
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+wheels/
+
+# Editor
+.idea/
+.vscode/
+.DS_Store
+
+# Claude Code session state
+.claude/
+
+# Editor swap files
+*.swp
+*.swo
+
+# VERINA campaign: regenerable derived data (embeds VERINA spec text)
+verina/triage.json
+
+verina/e2e/ regenerable per-task end-to-end bundles are committed (audit trail);
+# but the __pycache__ under benchmarks/verina is not:
+benchmarks/verina/__pycache__/

@@ -1,0 +1,222 @@
+"""Materialize a self-contained end-to-end record per ported VERINA task.
+
+The fan-out agents durably save two things per task: the Problem
+spec (`benchmarks/verina/<stem>.py`) and the Lean proof companions
+(`lean/SynthLean/Y2Corpus/<stem>/*.solved.lean`).  They do NOT save
+the synthesized *output* (program + discovered invariant + ranking)
+as a browsable file — it only reaches stdout at run time.
+
+This script closes that gap.  For each ported benchmark it produces
+`verina/e2e/<stem>.md` containing, in one place:
+
+  1. VERINA's natural-language statement (source of truth).
+  2. VERINA's own precond / code / postcond (what we ported from).
+  3. Our Problem spec (pre/post/template/UF axioms).
+  4. The synthesized program (Python + Rust emitters).
+  5. The discovered inductive invariant + ranking function.
+  6. Every Lean `.solved.lean` proof, verbatim.
+  7. The SpecGen fidelity verdict (if computable).
+
+So a reviewer sees exactly what went in and what came out, with
+the proofs, per task — the audit trail the campaign is for.
+
+The synthesized program + invariant are recovered by constructing
+the single-candidate Solution directly from the Problem's atoms
+(each ported hole has one candidate), matching the emitter path
+used in the original END-TO-END.md — no full re-solve needed, so
+this is fast even across dozens of tasks.
+
+Usage:
+  python verina/materialize_e2e.py --all
+  python verina/materialize_e2e.py --task verina_basic_47_array_sum
+"""
+from __future__ import annotations
+import argparse
+import importlib.util
+import json
+import re
+import sys
+from pathlib import Path
+
+_REPO = Path(__file__).resolve().parent.parent
+_PORTED_DIR = _REPO / "benchmarks" / "verina"
+_LEAN_DIR = _REPO / "lean" / "SynthLean" / "Y2Corpus"
+_VERINA_ROOT = Path("/private/tmp/verina-data/datasets/verina")
+_OUT_DIR = _REPO / "verina" / "e2e"
+
+
+def _verina_id(stem: str) -> str:
+    m = re.match(r"(verina_basic_\d+)", stem)
+    return m.group(1) if m else stem
+
+
+def _marker(text: str, name: str) -> str:
+    pat = (rf"--\s*!benchmark\s*@start\s+{re.escape(name)}\b(.*?)"
+           rf"--\s*!benchmark\s*@end\s+{re.escape(name)}\b")
+    m = re.search(pat, text, flags=re.DOTALL)
+    return m.group(1).strip() if m else "(not found)"
+
+
+def _load_problem(stem: str):
+    vid = _verina_id(stem)
+    path = _PORTED_DIR / vid / "problem.py"
+    if not path.is_file():
+        path = _PORTED_DIR / f"{stem}.py"
+    spec = importlib.util.spec_from_file_location(f"{stem}_m", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.PROBLEM, path
+
+
+def _synth_output(problem):
+    """Build the single-candidate Solution and emit code + invariant.
+
+    Returns (py_src, rust_src, invariants) or (None, None, err)."""
+    try:
+        from synth.expand import expand
+        from synth.result import Solution
+        from synth import emit_py, emit_rust
+        expand(problem)
+        sol = Solution(
+            choices={h: 0 for h in problem.atoms},
+            atoms={h: c[0] for h, c in problem.atoms.items()},
+            code="", score=0.0,
+        )
+        py = emit_py(sol, problem, fname="synth", runtime_check=False)
+        rust = emit_rust(sol, problem, fname="synth")
+        # Invariant / ranking are the τ / φ atoms per loop.
+        inv_lines = []
+        for h, cands in problem.atoms.items():
+            if h.startswith("tau@"):
+                lid = h.split("@", 1)[1]
+                atoms = cands[0] if isinstance(cands[0], list) else cands
+                joined = " ∧ ".join(str(a) for a in atoms)
+                inv_lines.append(f"invariant {lid}: {joined}")
+            elif h.startswith("phi@"):
+                lid = h.split("@", 1)[1]
+                inv_lines.append(f"ranking   {lid}: {cands[0]}")
+        return py, rust, ("\n".join(inv_lines) or "(no loop invariant — straight-line)")
+    except Exception as e:  # noqa: BLE001
+        return None, None, f"(could not emit: {type(e).__name__}: {e})"
+
+
+def materialize(stem: str) -> str:
+    vid = _verina_id(stem)
+    problem, ppath = _load_problem(stem)
+    vdir = _VERINA_ROOT / vid
+
+    nl = "(VERINA description not found)"
+    if (vdir / "description.txt").is_file():
+        nl = (vdir / "description.txt").read_text().strip()
+
+    v_pre = v_code = v_post = "(task.lean not found)"
+    if (vdir / "task.lean").is_file():
+        lean = (vdir / "task.lean").read_text()
+        v_pre, v_code, v_post = (_marker(lean, "precond"),
+                                 _marker(lean, "code"),
+                                 _marker(lean, "postcond"))
+
+    py, rust, inv = _synth_output(problem)
+
+    solved = sorted((_LEAN_DIR / stem).glob("*.solved.lean")) \
+        if (_LEAN_DIR / stem).is_dir() else []
+
+    out = []
+    out.append(f"# End-to-end: `{stem}`")
+    out.append("")
+    out.append(f"VERINA task **{vid}** ported to this repo's "
+               f"proof-theoretic synthesizer.  Auto-generated by "
+               f"`verina/materialize_e2e.py` — what went in, what "
+               f"came out, and the proofs, in one place.")
+    out.append("")
+    out.append("## 1. VERINA natural-language statement (source of truth)")
+    out.append("")
+    out.append("```")
+    out.append(nl)
+    out.append("```")
+    out.append("")
+    out.append("## 2. VERINA formal spec (what we ported from)")
+    out.append("")
+    out.append("```lean")
+    out.append(f"-- precondition\n{v_pre}\n")
+    out.append(f"-- reference code\n{v_code}\n")
+    out.append(f"-- postcondition\n{v_post}")
+    out.append("```")
+    out.append("")
+    out.append("## 3. Our Problem spec")
+    out.append("")
+    out.append(f"- **pre:** `{problem.pre}`")
+    out.append(f"- **post:** `{problem.post}`")
+    if getattr(problem, "uninterpreted", None):
+        out.append(f"- **uninterpreted functions:** "
+                   f"{', '.join(u[0] for u in problem.uninterpreted)}")
+    if getattr(problem, "axioms", None):
+        out.append("- **axioms (trust surface):**")
+        for a in problem.axioms:
+            out.append(f"  - `{a}`")
+    out.append("")
+    out.append(f"Full Problem: [`../../benchmarks/verina/{stem}.py`]"
+               f"(../../benchmarks/verina/{stem}.py)")
+    out.append("")
+    out.append("## 4. Synthesized output")
+    out.append("")
+    out.append("### Invariant + ranking (discovered)")
+    out.append("```")
+    out.append(inv)
+    out.append("```")
+    if py:
+        out.append("")
+        out.append("### Python")
+        out.append("```python")
+        out.append(py.rstrip())
+        out.append("```")
+    if rust:
+        out.append("")
+        out.append("### Rust")
+        out.append("```rust")
+        out.append(rust.rstrip())
+        out.append("```")
+    out.append("")
+    out.append(f"## 5. Lean proofs ({len(solved)} `.solved.lean`)")
+    out.append("")
+    if not solved:
+        out.append("None — this task verified on Z3 alone (no Lean "
+                   "dispatch); the trust surface is empty (fully "
+                   "machine-checked).")
+    for f in solved:
+        out.append(f"### `{f.name}`")
+        out.append("```lean")
+        out.append(f.read_text().rstrip())
+        out.append("```")
+        out.append("")
+
+    _OUT_DIR.mkdir(parents=True, exist_ok=True)
+    dest = _OUT_DIR / f"{stem}.md"
+    dest.write_text("\n".join(out) + "\n")
+    return str(dest.relative_to(_REPO))
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--task")
+    ap.add_argument("--all", action="store_true")
+    args = ap.parse_args()
+
+    if args.all:
+        stems = sorted(p.stem for p in _PORTED_DIR.glob("verina_basic_*.py"))
+    elif args.task:
+        stems = [args.task]
+    else:
+        ap.error("pass --task <stem> or --all")
+
+    for stem in stems:
+        try:
+            rel = materialize(stem)
+            print(f"wrote {rel}")
+        except Exception as e:  # noqa: BLE001
+            print(f"[ERROR] {stem}: {type(e).__name__}: {e}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

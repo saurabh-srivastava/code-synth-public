@@ -1,0 +1,2610 @@
+From Program Veriﬁcation to Program Synthesis
+
+Saurabh Srivastava
+
+Sumit Gulwani
+
+Jeffrey S. Foster
+
+University of Maryland, College Park
+saurabhs@cs.umd.edu
+
+Microsoft Research, Redmond
+sumitg@microsoft.com
+
+University of Maryland, College Park
+jfoster@cs.umd.edu
+
+Abstract
+This paper describes a novel technique for the synthesis of imper-
+ative programs. Automated program synthesis has the potential to
+make programming and the design of systems easier by allowing
+programs to be speciﬁed at a higher-level than executable code. In
+our approach, which we call proof-theoretic synthesis, the user pro-
+vides an input-output functional speciﬁcation, a description of the
+atomic operations in the programming language, and a speciﬁca-
+tion of the synthesized program’s looping structure, allowed stack
+space, and bound on usage of certain operations. Our technique
+synthesizes a program, if there exists one, that meets the input-
+output speciﬁcation and uses only the given resources.
+
+The insight behind our approach is to interpret program synthe-
+sis as generalized program veriﬁcation, which allows us to bring
+veriﬁcation tools and techniques to program synthesis. Our syn-
+thesis algorithm works by creating a program with unknown state-
+ments, guards, inductive invariants, and ranking functions. It then
+generates constraints that relate the unknowns and enforces three
+kinds of requirements: partial correctness, loop termination, and
+well-formedness conditions on program guards. We formalize the
+requirements that program veriﬁcation tools must meet to solve
+these constraint and use tools from prior work as our synthesizers.
+We demonstrate the feasibility of the proposed approach by syn-
+thesizing programs in three different domains: arithmetic, sorting,
+and dynamic programming. Using veriﬁcation tools that we previ-
+ously built in the VS3 project we are able to synthesize programs
+for complicated arithmetic algorithms including Strassen’s matrix
+multiplication and Bresenham’s line drawing; several sorting algo-
+rithms; and several dynamic programming algorithms. For these
+programs, the median time for synthesis is 14 seconds, and the ra-
+tio of synthesis to veriﬁcation time ranges between 1× to 92× (with
+an median of 7×), illustrating the potential of the approach.
+
+I.2.2 [Automatic Program-
+Categories and Subject Descriptors
+ming]: Program Synthesis; F.3.1 [Logics and Meanings of Pro-
+grams]: Specifying and Verifying and Reasoning about Programs
+
+General Terms Languages, Theory.
+
+Keywords Proof-theoretic program synthesis, veriﬁcation.
+
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for proﬁt or commercial advantage and that copies bear this notice and the full citation
+on the ﬁrst page. To copy otherwise, to republish, to post on servers or to redistribute
+to lists, requires prior speciﬁc permission and/or a fee.
+POPL’10,
+January 17–23, 2010, Madrid, Spain.
+Copyright c(cid:13) 2010 ACM 978-1-60558-479-9/10/01. . . $10.00
+
+Introduction
+
+1.
+Automated program synthesis, despite holding the promise of sig-
+niﬁcantly easing the task of programming, has received little atten-
+tion due to its difﬁculty. Being able to mechanically construct pro-
+grams has wide-ranging implications. Mechanical synthesis yields
+programs that are correct-by-construction. It relieves the tedium
+and error associated with programming low-level details, can aid in
+automated debugging and in general leaves the human programmer
+free to deal with the high-level design of the system. Additionally,
+synthesis could discover new non-trivial programs that are difﬁcult
+for programmers to build.
+
+In this paper, we present an approach to program synthesis
+that takes the correct-by-construction philosophy of program de-
+sign [14, 18, 38] and shows how it can be automated. Program ver-
+iﬁcation tools routinely synthesize program proofs in the form of
+inductive invariants for partial correctness and ranking functions
+for termination. We encode the synthesis problem as a veriﬁca-
+tion problem by encoding program guards and statements as logical
+facts that need to be discovered. This allows us to use certain veriﬁ-
+cation tools for synthesis. The veriﬁcation tool infers the invariants
+and ranking functions as usual, but in addition infers the program
+statements, yielding automated program synthesis. We call our ap-
+proach proof-theoretic synthesis because the proof is synthesized
+alongside the program.
+
+We deﬁne the synthesis task as requirements on the output pro-
+gram: functional requirements, requirements on the form of pro-
+gram expressions and guards, and requirements on the resources
+used. The key to our synthesis algorithm is the reduction from the
+synthesis task to three sets of constraints. The ﬁrst set are safety
+conditions that ensure the partial correctness of the loops in the pro-
+gram. The second set are well-formedness conditions on the pro-
+gram guards and statements, such that the output from the veriﬁca-
+tion tool (facts corresponding to program guards and statements)
+correspond to valid guards and statements in an imperative lan-
+guage. The third set are progress conditions that ensure that the
+program terminates. To our knowledge, our approach is the ﬁrst
+that automatically synthesizes programs and their proofs, while
+previous approaches have either used given proofs to extract pro-
+grams [27] or made no attempt to generate the proof. Some ap-
+proaches, while not generating proofs, do ensure correctness for a
+limited class of ﬁnitizable programs [29].
+
+To illustrate our approach, we next show how to synthesize
+Bresenham’s line drawing algorithm. This example is an ideal
+candidate for automated synthesis because, while the program’s
+requirements are simple to specify, the actual program is quite
+involved.
+
+1.1 Motivating Example
+
+As a motivating example, we consider a well-known algorithm
+from the graphics community called Bresenham’s line drawing
+algorithm, shown in Figure 1(a). The algorithm computes (and
+
+(a) Bresenhams(int X, Y ) {
+
+v1:=2Y −X; y:=0; x:=0;
+while (x ≤ X)
+out[x]:=y;
+if (v1 < 0)
+
+v1:=v1+2Y ;
+
+else
+
+v1:=v1+2(Y -X); y++;
+
+x++;
+
+return out;
+
+}
+
+(b) Bresenhams(int X, Y ) {
+
+[]true → v0
+while (x ≤ X)
+
+1=2Y −X ∧ y0=0 ∧ x0=0
+
+[]v1 < 0 → out0=upd(out,x,y) ∧ v0
+[]v1 ≥ 0 → out0=upd(out,x,y) ∧ v0
+
+1=v1+2Y ∧ y0=y ∧ x0=x+1
+1=v1+2(Y -X) ∧ y0=y+1 ∧ x0=x+1
+
+return out;
+
+}
+
+Invariant τ :
+
+(c)
+
+0 < Y ≤ X ∧ v1 = 2(x+1)Y −(2y+1)X ∧
+2(Y −X) ≤ v1 ≤ 2Y ∧
+∀k : 0 ≤ k < x ⇒ 2|out[k]−(Y /X)k| ≤ 1
+
+Ranking function ϕ : X − x
+
+Figure 1. (a) Bresenham’s line drawing algorithm (b) The invariant and ranking function that prove partial correctness and termination,
+respectively. (c) The algorithm written in transition system form, with statements as equality predicates, guarded appropriately.
+
+writes to the output array out) the discrete best-ﬁt line from (0, 0)
+to (X, Y ), where the point (X, Y ) is in the NE half-quadrant, i.e.,
+0 < Y ≤ X. The best-ﬁt line is one that does not deviate more
+than half a pixel away from the real line, i.e., |y − (Y /X)x| ≤ 1/2.
+For efﬁciency, the algorithm computes the pixel values (x, y) of
+this best-ﬁt line using only linear operations, but the computation is
+non-trivial and the correctness of the algorithm is also not evident.
+The speciﬁcation for this program is succinctly written in terms
+
+of its precondition τpre and postcondition τpost:
+
+τpre :
+τpost : ∀k : 0 ≤ k ≤ X ⇒ 2|out[k]−(Y /X)k| ≤ 1
+
+0 < Y ≤ X
+
+Notice that in the postcondition, we have written the assertion out-
+side the loop body for clarity of presentation, but it can easily
+be rewritten, as a quantiﬁer-free assertion, inside. Bresenham pro-
+posed the program shown in Figure 1(a) to implement this speciﬁ-
+cation. The question we answer is whether it is possible to synthe-
+size the program given just the speciﬁcation and a description of
+the available resources (control ﬂow, stack space and operations).
+Let us stepwise develop the idea behind synthesis starting from the
+veriﬁcation problem for the given program.
+
+Observe that we can write program statements as equality pred-
+icates and acyclic fragments as transition systems. For example, we
+can write x := e as x0 = e, where x0 is a renaming of x to its out-
+put value. We will write statements as equalities between the output
+(primed) versions of the variables and the expression (over the un-
+primed versions of the variables). Also, guards that direct control
+ﬂow in an imperative program can now be seen as guards for state-
+ment facts in a transition system. Figure 1(b) shows our example
+written in transition system form. To prove partial correctness, one
+can write down the inductive invariant for the loop and verify that
+the veriﬁcation condition for the program is in fact valid. The ver-
+iﬁcation condition consists of four implications for the four paths
+corresponding to the entry, exit, and one each for the branches in
+the loop. Using standard veriﬁcation condition generation, with the
+precondition τpre and postcondition τpost, and writing the renamed
+version of invariant τ as τ 0, these are
+
+τpre ∧ sentry ⇒ τ 0
+
+τ ∧ ¬gloop ⇒ τpost
+
+τ ∧ gloop ∧ gbody1 ∧ sbody1 ⇒ τ 0
+τ ∧ gloop ∧ gbody2 ∧ sbody2 ⇒ τ 0
+
+(1)
+
+where we use symbols for the various parts of the program:
+
+gbody1 : v1 < 0
+gbody2 : v1 ≥ 0
+gloop : x ≤ X
+sentry : v0
+1=2Y -X ∧ y0=0 ∧ x0=0
+sbody1 : out0=upd(out, x, y) ∧ v0
+sbody2 : out0=upd(out, x, y) ∧ v0
+
+1=v1+2Y ∧ y0=y ∧ x0=x+1
+1=v1+2(Y -X) ∧ y0=y+1 ∧ x0=x+1
+With a little bit of work, one can validate that the invariant τ shown
+in Figure 1(c) satisﬁes Eq. (1). Checking the validity of given in-
+
+variants can be automated using SMT solvers [10]. In fact, pow-
+erful program veriﬁcation tools now exist that can generate ﬁxed-
+point solutions—inductive invariants such as τ —automatically us-
+ing constraint-based techniques [6, 21, 32], abstract interpreta-
+tion [9] or model checking [3]. There are also tools that can prove
+termination [7]—by inferring ranking functions such as ϕ—and to-
+gether with the safety proof provide a proof for total correctness.
+
+The insight behind our paper is to ask the question, if we can
+infer τ in Eq. (1), then is it possible to infer the guards gi’s and the
+statements si’s at the same time? We have found that we can in-
+deed infer guards and statements as well, by suitably encoding pro-
+grams as transition systems, asserting appropriate constraints, and
+then leveraging program veriﬁcation techniques to do a systematic
+(lattice-theoretic) search for unknowns in the constraints. Here the
+unknowns now represent both the invariants and the statements and
+guards. It turns out that a direct solution to the unknown guards
+and statements may be uninteresting, i.e., it may not correspond
+to real programs. But we illustrate that we can impose additional
+well-formedness constraints on the unknown guards and statements
+such that any solution to this new set of constraints corresponds
+to a valid, real program. Additionally, even if we synthesize valid
+programs, it may be that the programs are non-terminating. There-
+fore we need to impose additional progress constraints that ensure
+that the synthesized programs are ones that we can actually run.
+We now illustrate the need for these well-formedness and progress
+constraints over our example.
+
+Suppose that the statements sentry, sbody1 and sbody2, are un-
+known. A trivial satisfying solution to Eq. (1) may set all these
+unknowns to false. If we use a typical program veriﬁcation tool
+that computes least ﬁxed-points starting from ⊥, then indeed, it will
+output this solution. On the other hand, let us make the conditional
+guards gbody1 and gbody2 unknown. Again, gbody1 = gbody2 = false
+is a satisfying solution. We get uninteresting solutions because the
+unknowns are not constrained enough to ensure valid statements
+and control-ﬂow. Statement blocks are modeled as V
+i x0
+i = ei,
+with one equality for each output variable x0
+i and expressions ei
+are over input variables. Therefore, false does not correspond to
+any valid block. Similarly gbody1 = gbody2 = false does not cor-
+respond to any valid conditional with two branches. For example,
+consider if (g) S1 else S2 with two branches. Note how S1 and
+S2 are guarded by g and ¬g, respectively, and g ∨ ¬g holds. For
+every valid conditional, the disjunction of the guards is always a
+tautology. In veriﬁcation, the program syntax and semantics en-
+sure the well-formedness of acyclic fragments. In synthesis, we will
+need to explicitly constrain well-formedness of acyclic fragments
+(Section 3.4).
+
+Next, suppose that the loop guard gloop is unknown. In this case
+if we attempt to solve for the unknowns τ and gloop, then one
+valid solution assigns τ = gloop = true, which corresponds to
+an non-terminating loop. In veriﬁcation, we were only concerned
+
+with partial correctness and assumed that the program was termi-
+nating. In synthesis, we will need to explicitly encode progress by
+inferring appropriate ranking functions, like ϕ in Figure 1(c), to
+prevent the synthesizer from generating non-terminating programs
+(Section 3.5).
+
+Note that our aim is not to solve the completely general synthe-
+sis problem for a given functional speciﬁcation. Guards and state-
+ments are unknowns but they take values from given domains, spec-
+iﬁed by the user as domain constraints, so that a lattice-theoretic
+search can be performed by existing program veriﬁcation tools.
+Also notice that we did not attempt to change the number of invari-
+ants or the invariant position in the constraints. This means that we
+assume a given looping or ﬂowgraph structure, e.g., one loop for
+our example. Lastly, as opposed to veriﬁcation, the set of program
+variables is not known, and therefore we need a speciﬁcation of the
+stack space available and also a bound on the type of computations
+allowed.
+
+We use the speciﬁcations to construct an expansion that is a pro-
+gram with unknown symbols and construct safety conditions over
+the unknowns. We then impose the additional well-formedness and
+progress constraints. We call the new constraints synthesis condi-
+tions and hope to ﬁnd solutions to them using program veriﬁcation
+tools. The constraints generated are non-standard, and therefore to
+solve them we need veriﬁcation tools that satisfy certain properties.
+Veriﬁcation tools we developed in previous work [32, 21] indeed
+have those properties. We use them to efﬁciently solve the syn-
+thesis conditions to synthesize programs, with a very acceptable
+slowdown over veriﬁcation.
+
+The guards, statements and proof terms for the example in
+this section come from the domain of arithmetic. Therefore, a
+program veriﬁcation tool for arithmetic would be appropriate. For
+programs whose guards and statements are more easily expressed
+in other domains, a corresponding veriﬁcation tool for that domain
+should be used. In fact, we have employed tools for the domains of
+arithmetic and predicate abstraction for proof-theoretic synthesis
+with great success. Our objective is to reuse existing veriﬁcation
+technology—that started with invariant validation and progressed
+to invariant inference—and push it further to program synthesis.
+
+1.2 Contributions
+
+This paper makes the following contributions:
+
+• We present a novel way of specifying a synthesis task as a
+triple consisting of the functional speciﬁcation, the domains of
+expressions and guards that appear in the synthesized program,
+and resource constraints that the program is allowed to use
+(Section 2).
+
+• We view program synthesis as generalized program veriﬁca-
+tion. We formally deﬁne constraints, called synthesis condi-
+tions, that can be solved using veriﬁcation tools (Section 3).
+
+• We present requirements that program veriﬁcation tools must
+meet in order to be used for synthesis of program statements
+and guards (Section 4).
+
+• We build synthesizers using veriﬁcation tools and present syn-
+thesis results for the three domains of arithmetic, sorting and
+dynamic programming (Section 5).
+
+2. The Synthesis Scaffold and Task
+We now elaborate on the speciﬁcations that a proof-theoretic ap-
+proach to synthesis requires and how these also allow the user to
+specify the space of interesting programs.
+
+We describe the synthesis problem using a scaffold of the form
+hF, D, Ri
+
+The three components are as follows:
+1. Functional Speciﬁcation The ﬁrst component F of a scaffold
+describes the desired precondition and postcondition of the synthe-
+sized program. Let ~vin and ~vout be the vectors containing the input
+and output variables, respectively. Then a functional speciﬁcation
+F = (Fpre( ~vin), Fpost( ~vin, ~vout)) is a tuple containing the formu-
+lae that hold at the entry and exit program locations. For example,
+.
+for the program in Figure 1, Fpre(X, Y )
+= (0 < Y ≤ X and
+.
+Fpost(X, Y, out)
+= ∀k : 0 ≤ k ≤ X ⇒ 2(Y /X)k − 1 ≤
+2out[k] ≤ 2(Y /X)k + 1.
+2. Domain Constraints The second component D of the scaffold
+describes the domains for expressions and guards in the synthesized
+program. The domain speciﬁcation D = (Dexp, Dgrd) is a tuple that
+constrains the respective components:
+
+2a. Program Expressions: The expressions manipulated by the pro-
+
+gram come from the domain Dexp.
+
+2b. Program Guards: The logical guards (boolean expressions)
+used to direct control ﬂow in the program come from the do-
+main Dgrd.
+
+For example, for the program in Figure 1, the domains Dexp, Dgrd
+are both linear arithmetic.
+3. Resource Constraints The third component R of the scaffold
+describes the resources that the synthesized program can use. The
+resource speciﬁcation R = (Rflow, Rstack, Rcomp) is a triple of
+resource templates that the user must specify for the ﬂowgraph,
+stack and computation, respectively:
+
+3a. Flowgraph Template We restrict attention to structured pro-
+grams (those that are goto-less, or whose ﬂowgraphs are re-
+ducible [22]). The structured nature of such ﬂowgraphs allows
+us to describe them using simple strings. The user speciﬁes a
+string Rflow from the following grammar:
+
+T ::= ◦ | ∗(T )
+
+| T ;T
+
+(2)
+
+where ◦ denotes an acyclic fragment of the ﬂow graph, ∗(T )
+denotes a loop containing the body T and T ;T denotes the
+sequential composition of two ﬂow graphs. For example, for
+the program in Figure 1, Rflow = ◦;∗(◦).
+
+3b. Stack Template A map Rstack : type → int indicating the
+number of extra temporary variables of each type available
+to the program. For example, for the program in Figure 1,
+Rstack = (int, 1).
+
+3c. Computation Template At times it may be important to put an
+upper bound on the number of times an operation is performed
+inside a procedure. A map Rcomp : op → int of operations op
+to the upper bound speciﬁes this constraint. For example, for
+the program in Figure 1, Rcomp = ∅ which indicates that there
+are no constraints on computation.
+
+On the one hand, the resource templates make synthesis tractable
+by enabling a systematic lattice-theoretic search, while on the other
+they allow the user to specify the space of interesting programs and
+can be used as a feature. For instance, the user may wish to reduce
+memory consumption at the expense of a more complex ﬂowgraph
+and still meet the functional speciﬁcation. If the user does not care,
+then the resource templates can be considered optional and left
+unspeciﬁed. In this case, the synthesizer can iteratively enumerate
+possibilities for each resource and attempt synthesis with increas-
+ing resources.
+
+2.1 Picking a proof domain and a solver for the domain
+
+Our synthesis approach is proof-theoretic and we synthesize the
+proof terms, i.e., invariants and ranking functions, alongside the
+
+program. These proof terms will take values from a suitably chosen
+proof domain Dprf. Notice that Dprf will be at least as expressive
+as Dgrd and Dexp. The user chooses an appropriate proof domain
+and also picks a solver capable of handling that domain. We will
+use program veriﬁcation tools as solvers and typically, the user will
+pick the most powerful veriﬁcation tool available for the chosen
+proof domain.
+
+2.2 Synthesis Task
+Given a scaffold hF, D, Ri, we call an executable program valid
+with respect to the scaffold if it meets the following conditions.
+
+• When called with inputs ~vin that satisfy Fpre( ~vin) the program
+terminates, and the resulting outputs ~vout satisfy Fpost( ~vin, ~vout).
+There are associated invariants and ranking functions that pro-
+vide a proof of this fact.
+
+• There is a program loop (with an associated loop guard g)
+corresponding to each loop annotation (speciﬁed by “∗”) in
+the ﬂowgraph template Rflow. The program contains statements
+from the following imperative language IML for each acyclic
+fragment (speciﬁed by “◦”).
+
+S ::= skip | S;S | x := e | if g then S else S
+
+Where x denotes a variable, e denotes some expression, and g
+denotes some predicate. (Memory reads and writes are modeled
+using memory variables and select/update expressions.) The
+domain of expressions and guards is as speciﬁed by the scaffold,
+i.e., e ∈ Dexp and g ∈ Dgrd.
+
+• The program only uses as many local variables as speciﬁed by
+Rstack in addition to the input and output variables ~vin, ~vout.
+• Each elementary operation only appears as many times as spec-
+
+iﬁed in Rcomp.
+
+√
+
+EXAMPLE 1 (Square Root). Let us consider a scaffold with func-
+tional speciﬁcation F = (x ≥ 1, (i − 1)2 ≤ x < i2), which states
+that the program computes the integral square root of the input x
+, i.e., i − 1 = b
+xc. Also, let the domain constraints Dexp, Dgrd
+be limited to linear arithmetic expressions, which means that the
+program cannot use any native square root or squaring operations.
+Lastly, let the Rflow, Rstack and Rcomp be ◦;∗(◦);◦, {(int, 1)} and
+∅, respectively. A program that is valid with respect to this scaffold
+is the following:
+
+IntSqrt(int x) {
+
+v:=1;i:=1;
+whileτ,ϕ(v ≤ x)
+v:=v+2i+1;i++;
+
+return i−1;
+
+}
+
+Invariant τ :
+
+v=i2 ∧x ≥ (i−1)2 ∧i ≥ 1
+
+Ranking function ϕ:
+
+x − (i−1)2
+
+where v, i are the additional stack variable and loop iteration
+counter (and reused in the output), respectively. Also, the loop
+is annotated with the invariant τ and ranking function ϕ as shown,
+and which prove partial correctness and termination, respectively.
+
+In the next two sections, we formally describe the steps of
+our synthesis algorithm. We ﬁrst generate synthesis conditions
+(Section 3), which are constraints over unknowns for statements,
+guards, loop invariants and ranking functions. We then observe that
+they resemble veriﬁcation conditions, and we can employ veriﬁca-
+tion tools, if they have certain properties, to solve them (Section 4).
+
+3. Synthesis Conditions
+In this section, we deﬁne and construct synthesis conditions for
+an input scaffold hF, D, Ri. Using the resource speciﬁcation R,
+we ﬁrst generate a program with unknowns corresponding to the
+fragments we wish to synthesize. Synthesis conditions then specify
+
+constraints on these unknowns and ensure partial correctness, loop
+termination and well-formedness of control-ﬂow. We begin our
+discussion by motivating the representation we use for acyclic
+fragments in the synthesized program.
+
+3.1 Using Transition Systems to Represent Acyclic Code
+
+Suppose we want to infer a set of (straight-line) statements that
+transform a precondition φpre to a postcondition φpost, where the
+relevant program variables are x and y. One approach might be to
+generate statements that assign unknown expressions ex and ey to
+x and y, respectively:
+
+{φpre}x := ex; y := ey{φpost}
+
+Then we can use Hoare’s axiom for assignment to generate the
+veriﬁcation condition φpre ⇒ (φpost[y 7→ ey])[x 7→ ex]. However,
+this veriﬁcation condition is hard to automatically reason about
+because it contains substitution into unknowns. Even worse, we
+have restricted the search space by requiring the assignment to
+y to follow the assignment to x, and by specifying exactly two
+assignments.
+
+Instead we will represent the computation as a transition system
+which provides a much cleaner mechanism for reasoning when pro-
+gram statements are unknown. A transition in a transition system
+is a (possibly parallel) mapping of the input variables to the output
+variables. Variables have an input version and an output version (in-
+dicated by primed names), which allows them to change state. For
+our example, we can write a single transition:
+{φpre} ˙x0, y0¸ = hex, eyi {φ0
+
+post}
+
+Here φ0
+post is the postcondition, written in terms of the output
+variables, and ex, ey are expressions over the input variables. The
+veriﬁcation condition corresponding to this tuple is φpre ∧ x0 =
+ex ∧ y0 = ey ⇒ φ0
+post. Note that every state update (assignment)
+can always be written as a transition.
+
+We can extend this approach to arbitrary acyclic program frag-
+ments. A guarded transition (written []g → s) contains a state-
+ment s that is executed only if the quantiﬁer-free guard g holds. A
+transition system consists of a set {[]gi → si}i of guarded transi-
+tions. It is easy to see that a transition system can represent any
+arbitrary acyclic program fragment by suitably enumerating the
+paths through the acyclic fragment. The veriﬁcation condition for
+{φpre}{[]gi → si}i{φ0
+post).
+In addition to the simplicity afforded by the lack of any order-
+ing, the constraints from transition systems are attractive for syn-
+thesis as the program statements si and guards gi are facts just
+like the pre- and postconditions φpre and φ0
+post. Given the lack of
+differentiation, any (or all) can be unknowns in these synthesis con-
+ditions. This distinguishes them from veriﬁcation conditions which
+can only have unknown invariants, or often the invariants must be
+known as well.
+
+i(φpre ∧ gi ∧ si ⇒ φ0
+
+post} is simply V
+
+Synthesis conditions can thus be viewed as generalizations of
+veriﬁcation conditions. Program veriﬁcation tools routinely infer
+ﬁxed-point solutions (invariants) that satisfy the veriﬁcation condi-
+tions with known statements and guards. With our formulation of
+statements and guards as just additional facts in the constraints, it
+is possible to use (sufﬁciently general) veriﬁcation tools to infer in-
+variants and program statements and guards. Synthesis conditions
+serve an analogous purpose to synthesis as veriﬁcation conditions
+do to veriﬁcation. If a program is correct (veriﬁable), then its veri-
+ﬁcation condition is valid. Similarly, if a valid program exists for a
+scaffold, then its synthesis condition has a satisfying solution.
+
+3.2 Expanding a ﬂowgraph
+
+We synthesize code fragments for each acyclic fragment and loop
+annotation in the ﬂowgraph template as follows:
+
+• Acyclic fragments: For each acyclic fragment annotation “◦”,
+we infer a transition system {gi → si}i, i.e., a set of assign-
+ments si, stated as conjunctions of equality predicates, guarded
+by quantiﬁer-free ﬁrst-order-logic (FOL) guards gi such that the
+disjunction of the guards is a tautology. Suitably constructed
+equality predicates and quantiﬁer-free FOL guards are later
+translated to executable code—assignment statements and con-
+ditional guards, respectively—in the language IML.
+
+• Loops: For each loop annotation “∗” we infer three elements.
+The ﬁrst is the inductive loop invariant τ , which establishes
+partial correctness of each loop iteration. The second is the
+ranking function ϕ, which proves the termination of the loop.
+Both the invariant and ranking function take values from the
+proof domain, i.e., τ, ϕ ∈ Dprf. Third, we infer a quantiﬁer-
+free FOL loop guard g.
+
+Formally, the output of expanding ﬂowgraphs will be a program
+in the transition system language TSL (note the correspondence to
+the ﬂowgraph grammar from Eq. 2):
+
+p ::= choose {[]gi → si}i
+
+| whileτ,ϕ(g) do {p} | p;p
+
+Here each si is a conjunction of equality predicates, i.e., V
+j (xj =
+ej). We will use ~p to denote a sequence of program statements
+in TSL. Note that we model memory read and updates using se-
+lect/update predicates. Therefore, in x = e the variable x could
+be a memory variable and e could be a memory select or update
+expression.
+
+Given a string for a ﬂowgraph template, we deﬁne an expan-
+sion function Expand : int ×Dprf ×R ×D ×Rflow → TSL that
+introduces fresh unknowns for missing guards, statements and in-
+n,Dprf
+D,R (Rflow) expands a
+variants that are to be synthesized. Expand
+ﬂowgraph Rflow and is parametrized by an integer n that indicates
+the number of transition each acyclic fragment will be expanded
+to, the proof domain and the resource and domain constraints. The
+expansion outputs a program in the language TSL.
+
+Expand
+
+n,Dprf
+D,R (◦) = choose {[]gi → si}i=1..n
+
+Expand
+
+n,Dprf
+D,R (∗(T )) = whileτ,ϕ (g) {
+
+Expand
+
+n,Dprf
+D,R (T );
+
+}
+
+gi, si : fresh
+unknowns
+τ, ϕ, g : fresh
+unknowns
+
+Expand
+
+n,Dprf
+D,R (T1;T2) = Expand
+
+n,Dprf
+D,R (T1);Expand
+
+n,Dprf
+D,R (T2)
+
+Each unknown g, s, τ generated during the expansion has the fol-
+lowing domain inclusion constraints.
+
+τ ∈ Dprf|V
+g ∈ Dgrd|V
+s ∈ V
+
+i xi = ei where xi ∈ V, ei ∈ Dexp|V
+
+Here V = ~vin ∪ ~vout ∪ T ∪ L is the set of variables: the input ~vin
+and output ~vout variables, the set of temporaries (local variables) T
+as speciﬁed by Rstack, and the set of iteration counters and ranking
+function tracker variables is L (which we elaborate on later), one
+for each loop in the expansion. The restriction of the domains by
+the variable set V indicates that we are interested in the fragment
+of the domain over the variables in V . Also, the set of operations in
+ei is bounded by Rcomp.
+
+The expansion has some similarities to the notion of a user-
+speciﬁed sketch in previous approaches [31, 29]. However, the un-
+knowns in the expansion here are more expressive than the integer
+unknowns considered earlier, and this allows us to perform a lattice
+search as opposed to the combinatorial approaches proposed ear-
+lier. Notice that the unknowns τ, g, s, ϕ we introduce can all be in-
+terpreted as boolean formulae (τ, g naturally; s using our transition
+
+modeling; and ϕ as ϕ > c, for some constant c), and consequently
+ordered in a lattice.
+
+EXAMPLE 2. Let us revisit the integral square root computation
+from Example 1. Expanding the ﬂowgraph template ◦;∗(◦);◦ with
+n = 1 yields expsqrt:
+
+choose {[]g1 → s1} ;
+whileτ,ϕ (g0) {
+
+choose {[]g2 → s2} ;
+
+};
+choose {[]g3 → s3}
+
+τ ∈ Dprf|V
+g1, g2, g3 ∈ Dgrd|V
+s1, s2, s3 ∈ V
+
+i xi = ei
+xi ∈ V, ei ∈ Dexp|V
+
+where V = {x, i, r, v}. The variables i and r are the loop iteration
+counter and ranking function tracker variable, respectively, and
+v is the additional local variable. Also, the chosen domains for
+proofs Dprf, guards Dgrd and expressions Dexp are FOL facts over
+quadratic expressions, FOL facts over linear arithmetic and linear
+arithmetic, respectively.
+
+Notice that the expansion encodes everything speciﬁed by the do-
+main and resource constraints and the chosen proof domain. The
+only remaining speciﬁcation is F, which we will use in the next
+section to construct safety conditions over the expanded scaffold.
+
+3.3 Encoding Partial Correctness: Safety Conditions
+
+Now that we have the expanded scaffold we need to collect the
+constraints (safety conditions) for partial correctness implied by the
+simple paths in the expansion. Simple paths (straight-line sequence
+of statements) start at a loop header Fpre and end at a loop header
+or program exit. The loop headers, program entry and program exit
+are annotated with invariants, precondition Fpre and postcondition
+Fpost, respectively.
+
+Let φ denote formulae, that represent pre and postconditions
+and constraints. Then we deﬁne PathC : φ × TSL × φ → φ
+as a function that takes a precondition, a sequence of statements
+and a postcondition and outputs safety constraints that encode the
+validity of the Hoare triple. Let us ﬁrst describe the simple cases of
+constraints from a single acyclic fragment and loop:
+
+PathC(φpre, (choose {[]gi → si}i ), φpost) =
+
+V
+
+i(φpre ∧ gi ∧ si ⇒ φpost
+
+0)
+
+PathC(φpre, (whileτ,ϕ (g) {~pl}), φpost) =
+
+φpre ⇒ τ 0 ∧ PathC(τ ∧ g, ~pl, τ ) ∧ (τ ∧ ¬g ⇒ φpost
+
+0)
+
+0 and τ 0 are the postcondition φpost and invariant τ but
+Here φpost
+with all variables renamed to their output (primed) versions. Since
+the constraints need to refer to output postconditions and invariants
+the rule for a sequence of statements is a bit complicated. For sim-
+plicity of presentation, we assume that acyclic annotations do not
+appear in succession. This assumption holds without loss of gener-
+ality because it is always possible to collapse consecutive acyclic
+fragments, e.g., two consecutive acyclic fragments with n transi-
+tions each can be collapsed into a single acyclic fragment with n2
+transitions. For efﬁciency, it is prudent to not make this assumption
+in practice, and the construction here generalizes easily. For a se-
+quence of statements in TSL, under the above assumptions, there
+are three cases to consider. First, a loop followed by statements
+~p. Second, an acyclic fragment followed by just a loop. Third, an
+acyclic fragment, followed by a loop, followed by statements ~p.
+Each of these generates the following, respective, constraints:
+PathC(φpre, (whileτ,ϕ (g) {~pl};~p), φpost) =
+
+(φpre ⇒ τ 0) ∧ PathC(τ ∧ g, ~pl, τ ) ∧ PathC(τ ∧ ¬g, ~p, φpost)
+PathC(φpre, (choose {[]gi → si}i ;whileτ,ϕ (g) {~pl}), φpost) =
+
+V
+
+V
+
+i(φpre ∧ gi ∧ si ⇒ τ 0) ∧ PathC(τ ∧ g, ~pl, τ ) ∧ (τ ∧ ¬g ⇒ φpost
+
+PathC(φpre, (choose {[]gi → si}i ;whileτ,ϕ (g) {~pl};~p), φpost) =
+
+0)
+
+i(φpre ∧ gi ∧ si ⇒ τ 0) ∧ PathC(τ ∧ g, ~pl, τ ) ∧ PathC(τ ∧ ¬g, ~p, φpost)
+
+The safety condition for a scaffold with functional speciﬁca-
+tion F = (Fpre, Fpost), ﬂowgraph template Rflow, and expansion
+exp = Expand
+
+(Rflow) is given by:
+
+D,R
+n,Dprf
+
+SafetyCond(exp, F) = PathC(Fpre, exp, Fpost)
+
+(3)
+
+EXAMPLE 3. Consider the expanded scaffold (from Example 2)
+and the functional speciﬁcation F (from Example 1) for integral
+square root. The loop divides the program into three simple paths,
+which results in SafetyCond(expsqrt, F):
+
+x ≥ 1 ∧ g1 ∧ s1 ⇒ τ 0
+τ ∧ g0 ∧ g2 ∧ s2 ⇒ τ 0
+
+τ ∧ ¬g0 ∧ g3 ∧ s3 ⇒ (i0 − 1)2 ≤ x0 ∧ x0 < i02
+
+∧
+∧
+
+Notice that gi, si, τ are all unknown placeholder symbols.
+
+3.4 Encoding Valid Control: Well-formedness Conditions
+
+We next construct constraints to ensure the well-formedness of
+choose statements. In the preceding development, we treated each
+path through the choose statement as independent. In any ex-
+ecutable program control will always ﬂow through at least one
+branch/transition of the statement, and each transition will contain
+well-formed assignment statements. We ﬁrst describe a constraint
+that encodes this directly and then discuss an alternative way of
+ensuring well-formedness of transition guards.
+
+Non-iterative upper bounded search During the expansion of
+a scaffold, we can choose n to be greater than the number of
+transitions expected in any acyclic fragment. Any excess transi-
+tions will have their guards instantiated to false. For any state-
+ment choose {[]gi → si} in the expansion, we impose the well-
+formedness constraint:
+WellFormTS({[]gi → si}i)
+
+.
+=`V
+
+i valid(si)´ Valid transition
+Covers space
+
+´
+
+∧ `W
+
+(4)
+
+i gi
+
+Here the predicate valid(si) ensures one and only one equality
+assignment to each variable in si. This condition ensures that each
+si corresponds to a well-formed transition that can be translated to
+executable statements. The second term constrains the combination
+of the guards to be a tautology. Note that this is important to ensure
+that each transition system is well-formed and can be converted to a
+valid executable conditional. For example, consider the executable
+conditional if (G) then x := E1 else x := E2. The correspond-
+ing transition system is {[]g1 → (x0 = E1), []g2 → (x0 = E2)},
+where g1 = G and g2 = ¬G and g1 ∨ g2 holds. In every well-
+formed executable conditional the disjunction of the guards will be
+a tautology. The second term imposes this constraint.
+
+Notice that this construction does not constrain the guards to
+be disjoint (mutually exclusive). Disjointedness is not required
+for correctness [11] because if multiple guards are triggered then
+arbitrarily choosing the body for any one sufﬁces. Therefore,
+without loss of generality, the branches can be arbitrarily ordered
+(thus ensuring mutual exclusivity) in the output to get a valid
+imperative program.
+
+Iterative lower bounded search Notice that Eq. (4) is non-
+standard, i.e., it is not an implication constraint like typical ver-
+iﬁcation conditions, and we will elaborate on this in Section 4.
+For the case when a program veriﬁcation tool is unable to handle
+such non-standard constraints, we need a technique for ensuring
+well-formedness of transitions without asserting Eq. (4).
+
+We ﬁrst assume that valid(si) holds, and we will show in
+Section 4.3 the conditions under which it does. Then all we need
+to ensure well-formedness is that ∨igi is a tautology. Since the
+transitions of a choose statement represent independent execution
+paths, we can perform an iterative search for the guards gi. We start
+
+by ﬁnding any satisfying guard (and corresponding transition)—
+which can even be false. We then iteratively ask for another guard
+(and transition) such that the space deﬁned by the new guard is not
+entirely contained in the space deﬁned by the disjunction of the
+guards already generated. If we ensure that at each step the newly
+discovered guard covers some more space that was not covered
+by earlier guards, then eventually the disjunction of all will be a
+tautology.
+
+More formally, suppose n such calls result in the transition
+system {[]gi → si}i=1..n, and ∨i=1..ngi is not already a tautology.
+Then for the n + 1st transition, we assert the constraint ¬(gn+1 ⇒
+(∨i=1..ngi)). This constraint ensures that gn+1 will cover some
+space not covered by ∨i=1..ngi. We repeat until ∨igi holds. This
+iterative search for the transitions also eliminates the need to guess
+the value of n.
+
+Well-formedness of an Expanded Scaffold We constrain the
+well-formedness of each transition system in the expanded scaf-
+fold exp = Expand
+
+(Rflow) using Eq. (4).
+
+D,R
+n,Dprf
+
+WellFormCond(exp) =
+
+^
+
+WellFormTS({[]gi → si}i) (5)
+
+choose {[]gi→si}i ∈cond(exp)
+
+where cond(exp) recursively examines the expanded scaffold exp
+and returns the set of all choose statements in it.
+
+EXAMPLE 4. For the expanded scaffold in Example 2, since
+each acyclic fragment only contains one guarded transition, the
+well-formedness constraints are simple and state that each of
+g1, g2, g3 = true and valid(s1)∧valid(s2)∧valid(s3) holds.
+
+3.5 Encoding Progress: Ranking functions
+
+Until now our encoding has focused on safety conditions that, by
+themselves, only ensure partial correctness but not termination.
+Next, we add progress constraints to ensure that the synthesized
+programs terminate.
+
+To encode progress for a loop l = whileτ,ϕl (g) do {~p}, we
+assert the existence of a ranking function as an unknown (numer-
+ical) expression ϕl that is lower bounded and decreases with each
+iteration of the loop. Because ϕl is an unknown expression it is dif-
+ﬁcult to encode directly that it decreases. Therefore, we introduce a
+tracking variable rl, such that rl = ϕl. We use rl to remember the
+value of the ranking function at the head of the loop, and because
+it is a proof variable no assignments to it can appear in the body
+of the loop. On the other hand, ϕl changes due to the loop body,
+and at the end of the iteration we can then check if the new value is
+strictly less than the old value, i.e., rl > ϕl. Without loss of gen-
+erality, we pick a lower bound of 0 for the tracking variable and
+conservatively assume that the termination argument is implied by
+the loop invariant τ , i.e, τ ⇒ rl ≥ 0.
+
+Now that we have asserted the lower bound, what remains is
+to assert that ϕl decreases in each iteration. Assume, for the time
+being, that the body does not contain any nested loops. Then we
+can capture the effect of the loop body using PathC as deﬁned
+earlier, with precondition τ ∧ g and postcondition rl > ϕ. Then,
+the progress constraint for loop l without any inner loop is:
+
+prog(l)
+
+.
+= (rl = ϕl ∧ (τ ⇒ rl ≥ 0) ∧ PathC(τ ∧ g, ~p, rl > ϕl))
+
+Using the above deﬁnition of progress we deﬁne the progress
+
+constraint for the entire expanded scaffold exp = Expand
+
+D,R
+n,Dprf
+
+(Rflow):
+
+RankCond(exp) =
+
+^
+
+prog(l)
+
+(6)
+
+l∈loops(exp)
+
+where loops(exp) recursively examines the expanded scaffold
+exp and returns the set of all loops in it.
+
+EXAMPLE 5. In the expanded scaffold of Example 2 there is only
+one loop, whose ranking function we denote by ϕl and with tracker
+rl. Then we generate the following progress constraint:
+rl = ϕl ∧ (τ ⇒ rl ≥ 0) ∧ (τ ∧ g0 ∧ g2 ∧ s2 ⇒ r0
+
+l > ϕ0
+l)
+
+To relax the assumption we made earlier about no nesting of
+loops, we need a simple modiﬁcation to the progress constraint
+prog(l). Instead of considering the effect of the entire body ~p
+(which now contains inner loops), we instead consider the fragment
+end(l) after the last inner loop in ~p. Also, let τend denote the
+invariant for the last inner loop. Then, the progress constraint for
+loop l is:
+
+prog(l)
+
+.
+= rl = ϕl ∧ (τ ⇒ rl ≥ 0) ∧ PathC(τend, end(l), rl > ϕl)
+
+Notice that because the loop invariants are not decided a priori, i.e.,
+we are not doing program extraction, we may assert that the invari-
+ants should be strong enough to satisfy the progress constraints.
+Speciﬁcally, we have imposed the requirement that the intermedi-
+ate loop invariants carry enough information such that it sufﬁces to
+consider only the last loop invariant τend in the assertion.
+
+3.6 Entire Synthesis Condition
+
+D,R
+n,Dprf
+
+Finally, we combine the constraints from the preceding sections to
+yield the entire synthesis condition for an expanded scaffold exp =
+(Rflow). The constraint SafetyCond(exp, F) (Eq. 3)
+Expand
+ensures partial correctness of the program with respect to the func-
+tional speciﬁcation. The constraint WellFormCond(exp) (Eq. 5)
+restricts the space to programs with valid control-ﬂow. The con-
+straint RankCond(exp) (Eq. 6) restricts the space to terminating
+programs. The entire synthesis condition is given by
+sc = SafetyCond(exp, F)∧WellFormCond(exp)∧RankCond(exp)
+
+Notice that we have omitted the implicit quantiﬁers for the sake
+of clarity. The actual form is ∃U ∀V : sc. The set V denotes
+the program variables, ~vin ∪ ~vout ∪ T ∪ L where T is the set of
+temporaries (additional local variables) as speciﬁed by the scaffold
+and L is the set of iteration counters and ranking function trackers.
+Also, U is the set of all unknowns of various types instantiated
+during the expansion of scaffold. This includes unknowns for the
+invariants τ , the guards g and the statements s.
+
+EXAMPLE 6. Accumulating the partial correctness, well-formedness
+of branching and progress constraints we get the following synthe-
+sis condition (where we have removed the trivial guards g1, g2, g3
+as discussed in Example 4):
+
+x ≥ 1 ∧ s1 ⇒ τ 0
+τ ∧ g0 ∧ s2 ⇒ τ 0
+
+∧
+∧
+τ ∧ ¬g0 ∧ s3 ⇒ (i0 − 1)2 ≤ x0 ∧ x0 < i02 ∧
+∧
+valid(s1) ∧ valid(s2) ∧ valid(s3)
+l > ϕ0
+rl = ϕl ∧ (τ ⇒ rl ≥ 0) ∧ (τ ∧ g0 ∧ s2 ⇒ r0
+l)
+
+Here is a valid solution to the above constraints:
+
+v = i2 ∧ x ≥ (i − 1)2 ∧ i ≥ 1
+τ :
+g0 :
+v ≤ x
+ϕl : x − (i − 1)2
+s1 :
+s2 :
+s3 :
+
+v0 = 1 ∧ i0 = 1 ∧ x0 = x ∧ r0
+v0 = v + 2i + 1 ∧ i0 = i + 1 ∧ x0 = x ∧ r0
+v0 = v ∧ i0 = i ∧ x0 = x ∧ r0
+
+l = rl
+
+l = rl
+
+l = rl
+
+(7)
+
+Notice how each of the unknowns satisfy their domain constraints,
+i.e., τ is from FOL over quadratic relations, ϕl is a quadratic
+expression, s1, s2, s2 are conjunctions of linear equalities and g0 is
+from quantiﬁer-free FOL over linear relations. In the next section
+we show how such solutions can be computed using existing tools.
+
+Input: Scaffold hF, D, Ri, maximum transitions n,
+
+proof domain Dprf
+
+Output: Executable program or FAIL
+begin
+
+n,Dprf
+exp := Expand
+D,R (Rflow);
+sc := SafetyCond(exp, F) ∧
+WellFormCond(exp) ∧
+RankCond(exp);
+
+π := Solver(sc);
+
+if (unsat(π)) then
+return FAIL;
+return Exeπ(exp);
+
+end
+
+Algorithm 1: The entire synthesis algorithm.
+
+Under the assumption [13] that every loop with a pre- and post-
+condition has an inductive proof of correctness, and every termi-
+nating loop has a ranking function, and that the domains chosen are
+expressive enough, we can prove that the synthesis conditions, for
+the case of non-iterative upper bounded well-formedness, model
+the program faithfully:
+
+THEOREM 1 (Soundness and Completeness). The synthesis con-
+ditions corresponding to a scaffold are satisﬁable iff there exists a
+program (with a maximum of n transitions in each acyclic frag-
+ment where n is the parameter to the expansion) that is valid with
+respect to the scaffold.
+
+Additionally, for the alternative approach to discovering guards
+
+(Section 3.4), we can prove soundness and relative completeness:
+
+THEOREM 2 (Soundness and Relative Completeness). (a) Sound-
+ness: If there exists a program that is valid with respect to the
+scaffold then at each step of the iteration the synthesis conditions
+generated are satisﬁable. (b) Relative completeness: If the iterative
+search for guards terminates then it ﬁnds a program that is valid
+with respect to the scaffold.
+
+4. Solving Synthesis Conditions
+In this section we describe how the synthesis conditions for an
+expanded scaffold can be solved using ﬁxed-point computation
+tools (program veriﬁers).
+
+Suppose we have a procedure Solver(sc) that can generate
+solutions to a synthesis condition sc. Algorithm 1 is our synthesis
+algorithm, which expands the given scaffold to exp, constructs
+synthesis conditions sc, uses Solver(sc) to generate a solution π
+to the unknowns that appear in the constraints and ﬁnally generates
+concrete programs (whose acyclic fragments are from the language
+IML from Section 2) using the postprocessor Exeπ(exp).
+
+The concretization function Exeπ(exp) takes the solution π
+computed by Solver(sc) and the expanded scaffold exp, and
+outputs a program whose acyclic fragments are from the language
+IML. The function deﬁnes a concretization for each statement in
+TSL and annotates each loop with its loop invariant and ranking
+function:
+
+Exeπ(whileτ,ϕ(g) do {~p}) =
+
+Exeπ(p;~p) = Exeπ(p);Exeπ(~p)
+
+Exeπ(choose {[]g → s}) =
+
+whileπ(τ ),π(ϕ)(π(g)) { Exeπ(~p) }
+
+Exeπ(choose {[]gi → si}i=1..n) =
+
+(where n > 1)
+
+if (π(g)) {Stmt(π(s))} else {skip}
+
+if (π(g1)) {Stmt(π(s1))}
+else {Exeπ(choose {[]gi → si}i=2..n)}
+
+where π maps each s to a conjunction of equalities and the con-
+cretization function Stmt(s) expands the equality predicates to
+their corresponding state updates:
+
+Stmt(
+
+^
+
+xi = ei)
+
+.
+=
+
+i=1..n
+
+(t1 := e1; . . ;tn := en);
+
+(x1 := t1; . . ;xn := tn)
+
+The above is a simple translation that uses additional fresh tem-
+porary variables t1 . . tn to simulate parallel assignment. Alterna-
+tively, one can use data dependency analysis to generate code that
+uses fewer temporary variables.
+
+4.1 Basic Requirement for Solver(sc)
+
+Our objective is to use veriﬁcation tools to implement Solver(sc),
+but we realize that not all tools are powerful enough. For use as
+a solver for synthesis conditions, veriﬁcation tools require certain
+properties.
+
+Let us ﬁrst recall [32] the notion of the polarity of unknowns
+in a formula. Let φ be a FOL formula with unknowns whose
+occurrences are unique. Notice that all the constraints we gen-
+erate have unique occurrences as we rename appropriately. We
+can categorize unknowns as either positive or negative such that
+strengthening (weakening) the positive (negative) unknowns makes
+φ stronger. Structurally, the nesting depth under negation—in the
+boolean formula written using the basic operators (∨, ∧, ¬, ∃, ∀)—
+deﬁnes whether an unknown is positive (even depth) or negative
+(odd depth). For example, the formula (a ∨ ¬b) ∧ ¬(¬c ∨ d) has
+positive unknowns {a, c} and negative unknowns {b, d}.
+
+In program veriﬁcation we infer loop invariants given veriﬁca-
+tion conditions with known program statements. Let us reconsider
+the veriﬁcation condition in Eq. (1) with known program statements
+and guards. Notice that the constraints can be categorized into three
+forms, τ ∧ f1 ⇒ τ 0, τ ∧ f2 ⇒ f3 and f4 ⇒ τ 0, where fi’s de-
+note known formulae. Also, observe that these three are the only
+forms in which constraints in veriﬁcation conditions can occur.
+From these, we can see that the veriﬁcation conditions contain at
+most one positive and one negative unknown (using the disjunctive
+translation of implication), depending on whether the correspond-
+ing path ends or starts at an invariant. Program veriﬁcation tools
+implementing typical ﬁxed-point computation algorithms are spe-
+cialized to work solely with constraints with one positive and one
+negative unknown because there is no need to be more general.
+
+In fact, traditional iterative ﬁxed-point computation is even
+more specialized in that it requires support for either just one pos-
+itive unknown or just one negative unknown. Traditional veriﬁers
+work either in a forward (computing least ﬁxed-point) or back-
+wards (computing greatest-ﬁxed point) direction starting with the
+approximation ⊥ or >, respectively, and iteratively reﬁning it.
+
+A backwards iterative data ﬂow analyzer always instantiates the
+positive unknown to the current approximation and uses the result-
+ing constraint (with only one negative unknown) to improve the
+approximation. For example, suppose the current approximation to
+the invariant τ is f5, then a backwards analyzer may instantiate τ 0
+in the constraint τ ∧ f1 ⇒ τ 0 to get the formula τ ∧ f1 ⇒ f 0
+5 (with
+one negative unknown τ ). It will then use the formula to improve
+the approximation by computing a new value for τ that makes this
+formula satisﬁable.
+
+Similarly, a typical forwards iterative data ﬂow analyzer in-
+stantiates the negative unknown to the current approximation and
+uses the resulting constraint (with only one positive unknown) to
+improve the approximation. For example, suppose the current ap-
+proximation to the invariant τ is f6, then a forwards analyzer may
+instantiate τ in the constraint τ ∧ f1 ⇒ τ 0 to get the formula
+f6 ∧ f1 ⇒ τ 0 (with one positive unknown τ ). It will then use the
+formula to improve the approximation by computing a new value
+for τ 0 that makes this formula satisﬁable.
+
+In contrast, let us consider the components (from Section 3)
+of the synthesis condition. The component SafetyCond(exp)
+(Eq. (3)), in addition to the unknowns due to the invariants τ ,
+contains unknowns for the program guards g and program state-
+ments s. These unknowns appear exclusively as negative un-
+knowns, and there can be multiple such unknowns in each con-
+straint. For example, in Eq. (1), the guards and statement unknowns
+appear as negative unknowns. On the other hand, the component
+WellFormCond(exp) (Eq. (5)) contains the well-formedness con-
+dition on the guards ∨igi that is a constraint with multiple positive
+unknowns. Therefore we need a veriﬁer that satisﬁes the following.
+
+REQUIREMENT 1. Support for multiple positive and multiple neg-
+ative unknowns.
+
+Notice this requirement is more general than that supported by
+
+typical veriﬁers we discussed above.
+
+Now consider, an example safety constraint such as τ ∧ g ∧ s ⇒
+τ 0 with unknowns τ , g and s, that can be rewritten as τ ⇒ τ 0 ∨
+¬g∨¬s. Also, let us rewrite an example well-formedness constraint
+∨gi as true ⇒ ∨gi. This view presents an alternative explanation
+for Requirement 1 in that we need a tool that can infer the right
+case split, which in most cases would not be unique and would
+require maintaining multiple orthogonal solutions. Intuitively, this
+is related to a tool’s ability to infer disjunctive facts.
+
+In the above we implicitly assumed the invariant to be a con-
+junction of predicates. In the general case, we may wish to infer
+more expressive (disjunctive) invariants, e.g., of the form u1 ⇒ u2
+or ∀k : u3 ⇒ u4, where ui’s are unknowns. In this case, multi-
+ple negative and positive unknowns appear even in the veriﬁcation
+condition and therefore the veriﬁcation tool must satisfy Require-
+ment 1, which matches the intuition that disjunctive inference is
+required.
+
+4.2 Constraint-based Veriﬁers as Solver(sc)
+
+Constraint-based ﬁxed-point computation is a relatively recent ap-
+proach to program veriﬁcation that has been successfully used for
+difﬁcult analyses [32]. In previous work, we designed efﬁcient
+constraint-based veriﬁcation tools for two popular domains, pred-
+icate abstraction [32, 20] and linear arithmetic [21]. The tools for
+both domains satisfy Requirement 1.
+
+Constraint-based veriﬁcation tools reduce a veriﬁcation condi-
+tion vc (with invariant unknowns) to a boolean constraint ψ(vc)
+such that a satisfying solution to the boolean constraint corresponds
+to valid invariants. The property they ensure is the following:
+
+PROPERTY 1. The boolean constraint ψ(vc) is satisﬁable iff there
+exists a ﬁxed-point solution for the unknowns corresponding to the
+invariants.
+
+The reduction can also be applied to synthesis condition sc to get
+boolean constraints ψ(sc) and a similar property holds. That is, the
+boolean constraint ψ(sc) is satisﬁable iff there exist statements,
+guards and invariants that satisfy the synthesis condition.
+
+4.3 Iterative Veriﬁers as Solver(sc)
+
+Let us now consider the case where the veriﬁcation tool cannot han-
+dle non-standard constraints, such as Eq. (4). This is the case for
+typical iterative program veriﬁcation tools that compute increas-
+ingly better approximations to invariants. We show that despite this
+lack of expressivity it is still possible to solve synthesis conditions
+as long as the tool satisﬁes an additional requirement.
+
+The only non-implication constraint in the synthesis condition
+sc is WellFormCond(sc). In Section 3.4, we discussed how an it-
+erative lower-bounded search can discover the transitions {[]gi →
+si}i without asserting Eq. (5). There we had left the question of
+ensuring valid(si) unanswered. Consider now the case where a
+
+valid solution gi, si exists (i.e., si is not false or that valid(si)
+holds) that satisﬁes the constraint set. As an instance, in Example 6,
+we have a synthesis condition for which a valid solution exists as
+shown by Eq. (7). Notice that this solution is strictly weaker than
+another solution that assigns identical values to other unknowns
+but assigns false to any of s2, s2 or s3. In fact, we can observe
+that if the tool only generates maximally weak solutions then be-
+tween these two solutions (which are comparable as we saw), it
+will always pick the one in which it does not assign false to state-
+ment unknowns. Therefore, it will always generate si such that
+valid(si) holds unless no such si exists. Therefore, if the pro-
+gram veriﬁcation tool satisﬁes the following requirement, then we
+can omit Eq. (5) from the synthesis condition and still solve it using
+the tool.
+
+REQUIREMENT 2. Solutions are maximally weak.
+
+This requirement corresponds to the tool’s ability to compute
+weakest preconditions. The typical approach to weakest precon-
+ditions (greatest ﬁxed-point) computation propagates facts back-
+wards, but this is considered difﬁcult and therefore not many tools
+exist that do this. However, although traditional iterative data ﬂow
+veriﬁers fail to meet Requirements 1 and 2, there do exist some iter-
+ative tools [32] that compute maximally weak solutions and there-
+fore satisfy the requirements.
+
+We have argued that maximally weak solutions for statement
+unknowns si ensure valid(si), but this comes at the cost of de-
+graded performance because maximally weak solutions are gener-
+ated for guard and invariant unknowns too. We require maximally
+weak solutions only for the statement unknowns, while for syn-
+thesis we are interested in any solution to the guard and invari-
+ant unknowns that satisfy the synthesis condition. In our trials, the
+constraint-based scheme [21, 32] (which computes any ﬁxed-point
+in the lattice rather than the greatest ﬁxed-point) outperformed the
+iterative scheme [32]. In fact, our tool based on iterative approxi-
+mations does not terminate for most benchmarks, and we therefore
+perform the experiments using our constraint-based tool.
+
+5. Experimental Case Studies
+To evaluate our approach, we synthesized examples in three cate-
+gories: First, easy to specify but tricky to program arithmetic pro-
+grams; second, sorting programs, which all have the same spec-
+iﬁcation but yield different sorting strategies depending on the
+resource constraints; third, dynamic programming programs for
+which naive solutions yield exponential runtimes, but which can
+be computed in polytime by suitable memoization.
+
+5.1
+
+Implementation
+
+We augmented our constraint-based veriﬁcation tools from prior
+work to build more powerful veriﬁers that we use as solvers for
+synthesis conditions. In this section, we summarize the capabilities
+of these tools and our extensions to them. The description here
+is necessarily brief due to lack of space, and more details can be
+found in the companion technical report [35]. We also describe a
+technique we use to simplify user input by expanding ﬂowgraphs
+to be more expressive as required sometimes.
+
+Veriﬁcation Tools Our synthesis technique relies on an underly-
+ing program veriﬁcation tool. For this work, we used tools that are
+part of the VS3 project [33]. We used two tools: an arithmetic veriﬁ-
+cation tool [21], which we call VS3
+LIA here; and a predicate abstrac-
+tion veriﬁcation tool [32, 34, 20], which we call VS3
+LIA and VS3
+
+PA here.
+PA are based on
+the idea of reducing the problem of invariant generation to satisﬁa-
+bility solving. Each tool takes as input a C program (annotated with
+assertions, typically the postcondition; and assumptions, typically
+
+Capabilities Both veriﬁcation tools VS3
+
+the precondition) and hints about the form of the invariants. The
+tool then generates invariants that sufﬁce to prove the assertions. If
+the tool fails to generate the invariants, then either the assertions in
+the program do not hold or no invariants exist that are instantiations
+of the given template form.
+
+• VS3
+
+LIA works over the theory of linear arithmetic and discovers
+(quantiﬁer-free) invariants in DNF form with linear inequalities
+over program variables as the atomic facts. As hints, it expects
+three integer parameters, maxdsj, maxcnj, maxbv. The param-
+eters maxdsj and maxcnj limit the maximum number of dis-
+juncts and conjuncts (in each disjunct) in the invariants. Ad-
+ditionally, maxbv is a integer pair (b1, b2) for the size in bits
+of invariant coefﬁcients b1 and intermediate computations b2.
+None of our synthesized benchmarks required disjunctive in-
+variants (maxdsj = 1), and we choose appropriate values for
+maxcnj and maxbv for different benchmarks. For example, sup-
+pose x, y, z are the program variables and x ≤ y ∧ z = x + 1
+is the unknown program invariant. The user will specify some
+value v1 for maxcnj and (v2, v3) for maxbv. VS3
+LIA will setup and
+solve constraints for a conjunctive invariant with atoms of the
+form c0 + c1x + c2y + c3z ≥ 0. It will search for solutions to
+each coefﬁcient ci assumed to have v2 bits and use v3 bits for
+any intermediate values in the constraints. In this example, any
+v1 ≥ 3 and any v2 ≥ 2 (one bit for the sign) will work, and we
+can choose a large enough v3 to avoid overﬂows.
+
+• VS3
+
+PA works over a combination of the theories of equality
+with uninterpreted functions, arrays, and linear arithmetic and
+discovers (possibly) quantiﬁed invariants. VS3
+PA expects the
+boolean structure of the invariants, i.e., quantiﬁcation and dis-
+junctions, to be made explicit as a template. As hints, it expects
+a boolean template T (with holes for conjunctive facts) and a
+set of predicates P . VS3
+PA infers the subset of predicates from
+P —the atoms of the conjunct—that populate the holes in T .
+For example, if x ≥ 0 ∧ ∀k : 0 ≤ k ≤ x ⇒ A[k] ≤ A[k + 1]
+is the invariant, then VS3
+PA would discover it when run with any
+T that is at least ([−] ∧ ∀k : [−] ⇒ [−]) and any P that is a
+superset of {x ≥ 0, k ≥ 0, x ≥ k, A[k + 1] ≥ A[k]}, where
+[−] denotes a conjunctive hole.
+
+Extensions These tools are powerful and can infer expressive
+invariants such as those requiring quantiﬁcation and disjunction,
+but for some of the benchmarks, the reasoning required was beyond
+even their capabilities. We therefore extended the base veriﬁers
+with the following features.
+
+• Quadratic expressions for arithmetic For handling quadratic ex-
+pressions in the proofs, we implemented a sound but incom-
+plete technique that renames quadratic expressions to fresh vari-
+ables and then uses linear arithmetic reasoning, already built
+into VS3
+LIA. This sufﬁces for most of our benchmarks, except
+when linear relations need to be lifted to quadratic relations,
+e.g., a ≥ b ≥ 0 ⇒ a2 ≥ b2 ≥ 0. This happens in one isolated
+step in the integral square root binary search case, which we
+circumvent by explicitly encoding an assumption. We call this
+augmented solver VS3
+
+QA.
+
+• Axiomatization Proposals exist for extending veriﬁcation tools
+with axioms for theories they do not natively support, e.g., the
+theory of reachability for lists [26]. We take such axiomatiza-
+tion a step further and allow the user to specify axioms over
+uninterpreted symbols that deﬁne computations. We implement
+this in VS3
+PA to specify the meaning of dynamic programming
+programs, e.g., the deﬁnition of Fibonacci. We call this aug-
+mented solver VS3
+
+AX.
+
+(a)
+Strassens(int aij , bij ) {
+v1:=(a11+a22)(b11+b22)
+v2:=(a21+a22)b11
+v3:=a11(b12-b22)
+v4:=a22(b21-b11)
+v5:=(a11+a12)b22
+v6:=(a21-a11)(b11+b12)
+v7:=(a12-a22)(b21+b22)
+c11:=v1+v4-v5+v7
+c12:=v3+v5
+c21:=v2+v4
+c22:=v1+v3-v2+v6
+return cij ;
+
+}
+(c)
+Fib(int n) {
+
+v1:=0;v1:=1;i1:=0;
+whileτ,ϕ(i1 ≤ n)
+
+v1:=v1+v2;swap(v1, v2);
+i1++;
+return v1;
+
+}
+Ranking function ϕ:
+
+x − s
+
+Invariant τ :
+
+v1 = Fib(i1) ∧ v2 = Fib(i1 +1)
+
+(b)
+SelSort(int A[], n) {
+
+i1:=0;
+whileτ1,ϕ1 (i1 < n − 1)
+
+v1:=i1;
+i2:=i1+1;
+whileτ2,ϕ2 (i2 < n)
+if (A[i2] < A[v1])
+v1:=i2;
+
+i2++;
+
+swap(A[i1], A[v1]);
+i1++;
+return A;
+
+}
+Ranking functions:
+ϕ1 : n − i1 − 2
+ϕ2 : n − i2 − 1
+
+Invariant τ1:
+
+∀k1, k2 : 0 ≤ k1 < k2 < n
+
+∧ k1 < i1 ⇒ A[k1] ≤ A[k2]
+
+Invariant τ1:
+
+i1 < i2 ∧ i1 ≤ v1 < n
+∀k1, k2 : 0 ≤ k1 < k2 < n
+
+∧ k1 < i1 ⇒ A[k1] ≤ A[k2]
+
+∀k : i1 ≤ k < i2 ∧ k ≥ 0
+
+⇒ A[v1] ≤ A[k]
+
+Figure 2. Illustrative examples from each of the domains. (a)
+Arithmetic: Strassen’s Matrix Multiplication (b) Sorting: Selec-
+tion Sort (c) Dynamic Programming: Fibonacci. For simplifying
+the presentation, we omit degenerate conditional branches, i.e.
+true/false guards, We name the loop iteration counters L =
+{i1, i2, . .} and the temporary stack variables T = {v1, v2, . .}.
+
+Note that these extensions are to facilitate veriﬁcation and not syn-
+thesis. The synthesis solver is exactly the same as the veriﬁcation
+tool. Without the extensions most of our benchmarks cannot even
+be veriﬁed, and thus their veriﬁcation can be seen as an independent
+contribution.
+
+Flowgraphs with Init/Final Phases
+In practice a fair number of
+loops have characteristic initialization and ﬁnalization phases that
+exhibit behavior different from the rest of the loop. In theory, ver-
+iﬁers should be able to infer loop invariants that capture such se-
+mantically different phases. However, this requires disjunctive rea-
+soning, which is fairly expensive if at all supported by the veriﬁer.
+Instead we use an alternate expansion Expand n(T ) that introduces
+acyclic fragments for the initialization and ﬁnalization if synthesis
+without them fails. For instance, for Example 1, the the user only
+needs to specify the ﬂowgraph ∗(◦) instead of the more compli-
+cated ◦;∗(◦);◦. Except for the expansion of loops, Expand n(T )
+expands all other statements exactly like Expandn(T ) does. For
+loops, it builds an initialization and ﬁnalization phase as follows.
+Expand n(∗(T ))=Expandn(◦);
+
+→ Added initialization
+
+whileτ (g) {Expand n(T );}
+Expandn(◦);
+
+→ Added ﬁnalization
+
+specify an acyclic ﬂowgraph template Rflow
+tion template Rcomp
+no temporaries are used we specify Rstack
+generates various versions of the program, e.g., one being
+
+.
+= ◦ and a computa-
+.
+= ∅ that imposes no constraints. To ensure that
+.
+= ∅. The synthesizer
+
+Swap(int x, y){x := x + y; y := x − y; x := x − y; }
+
+Strassen’s 2 × 2 Matrix Multiplication Consider Strassen’s ma-
+trix multiplication, which computes the product of two n × n ma-
+trices in Θ(n2.81) time instead of Θ(n3). The key to this algorithm
+is an acyclic fragment that computes the product of two 2 × 2 input
+matrices {aij, bij}i,j=1,2 using 7 multiplications instead of the ex-
+pected 8. Used recursively, this results in asymptotic savings. We
+do not attempt to synthesize the full matrix multiplication proce-
+dure because it contains no signiﬁcant insight. Instead, we synthe-
+size the crucial acyclic fragment, which is shown in Figure 2(a).
+Here the precondition Fpre is true and the postcondition Fpost is
+the conjunction of four equalities as (over the outputs {cij}i,j=1,2):
+„ a11b11 + a12b21
+a21b11 + a22b21
+
+a11b12 + a12b22
+a21b12 + a22b22
+
+„ c11
+c21
+
+c12
+c22
+
+=
+
+«
+
+«
+
+The synthesizer also generates many alternate versions that are
+functionally equivalent to Figure 2(a).
+
+As a side note, we also attempted synthesis using 6 multipli-
+cations, which failed. This suggests that possibly no asymptoti-
+cally faster solution exists using simple quadratic computations—
+theoretical results up to n2.376 are known, but use products that
+cannot be easily be captured in the simple domains considered here.
+
+√
+
+Integral Square Root Consider computing the integral square
+root b
+xc of a positive number x using only linear or quadratic
+.
+= x ≥ 1 and the postcon-
+operations. The precondition is Fpre
+.
+= (i − 1)2 ≤ x < i2.
+dition, involving the output i, is Fpost
+.
+We provide a single loop ﬂowgraph template Rflow
+= ∗(◦) and
+.
+an empty computation template Rcomp
+= ∅. The synthesizer gen-
+erates different programs depending on the domain constraints and
+the stack template:
+
+• Rstack
+
+• Rstack
+
+.
+= {(int, 0)} and we allow quadratic expressions in
+Dexp, Dgrd. The synthesized program does a sequential search
+downwards starting from i = x by continuously recomputing
+and checking (i − 1)2 against x.
+
+.
+= {(int, 1)} and we only allow linear expressions in
+Dexp, Dgrd. The synthesized program does a sequential search
+but uses the additional local variable rather surprisingly to track
+the value of (i − 1)2 using only linear updates. The synthesized
+program is Example 1, from earlier.
+
+.
+= {(int, 2)} and we allow quadratic expressions in
+Dexp, Dgrd. The synthesized program does a binary search for
+the value of i and uses the two additional local variables to hold
+the low and high end of the binary search space. To restrict
+reasoning to linear arithmetic we model m = b(s1 + s2)/2c
+as the assumption s1 ≤ m ≤ s2. Additionally, because of the
+incompleteness in the handling of quadratic expressions, our
+solver cannot derive (s2 + 1)2 ≤ s2
+1 from s2 + 1 ≤ s1. Thus
+we provide the quadratic inequality as another assumption.
+
+• Rstack
+
+5.2 Algorithms that use arithmetic
+
+For this category, we pick Dprf to be quadratic arithmetic and use
+as our solver the VS3
+QA tool. We chose a set of arithmetic benchmarks
+with simple-to-state functional speciﬁcations but each containing
+some tricky insight that human programmers may miss.
+
+Swapping without Temporaries Consider a program that swaps
+two integer-valued variables without using a temporary. The pre-
+.
+condition and postcondition to the program are speciﬁed as Fpost
+=
+.
+= (x = c1 ∧y = c2), respectively. We
+(x = c2 ∧y = c1) and Fpre
+
+We specify the precondition Fpre
+
+Bresenham’s Line Drawing Algorithm Consider Bresenham’s
+line drawing algorithm, as we discussed in Section 1.1. For efﬁ-
+ciency, the algorithm only uses linear updates, which are non-trivial
+to verify [16] or even understand (let alone discover from scratch).
+.
+= 0 < Y ≤ X. The post-
+condition can be written as a quantiﬁed assertion outside the loop
+or as a quantiﬁer-free assertion inside the loop, as mentioned in
+Section 1.1. We choose to annotate the ﬂowgraph with the simpler
+quantiﬁer-free 2|y − (Y /X)x| ≤ 1 at the loop header and addi-
+tionally specify that the loop iterates over x = 0 . . X. This simpli-
+
+ﬁcation in the implementation allowed us to use VS3
+supports quantiﬁer-free facts.
+
+We specify a single loop ﬂowgraph Rflow
+
+.
+= ∗(◦) and empty
+.
+stack and computation templates Rstack
+= ∅. The
+synthesizer generates multiple versions, one of which is exactly
+as shown in Figure 1(b) and can be translated to the program in
+Figure 1(a).
+
+.
+= ∅, Rcomp
+
+QA, which only
+
+5.3 Sorting Algorithms
+
+For this category, we pick Dprf to be the theory supported by
+VS3
+PA, which we use as our solver. The current version of our
+tool works with a user-supplied set of predicates. We are working
+on predicate inference techniques—in the style of CEGAR-based
+model checkers [23]—but for now, we give the tool a candidate set
+of predicates.
+
+The sortedness speciﬁcation consists of the precondition Fpre
+
+.
+=
+.
+true and the postcondition Fpost
+= ∀k : 0 ≤ k < n ⇒ A[k] ≤
+A[k + 1]. The full functional speciﬁcation would also ensure that
+the output array is a permutation of the input, but verifying—and
+thus, synthesizing—the full speciﬁcation is outside the capabilities
+of most tools today.
+
+We therefore use a mechanism to limit the space of programs to
+desirable sorting algorithms, while still only using Fpost. We limit
+Dexp to those that only involve operations that maintain elements—
+for example, swapping elements or moving elements to unoccupied
+locations. Using this mechanism, we ensure that invalid algorithms
+(that replicate or lose array elements) are not considered.
+
+Non-recursive sorting algorithms Consider comparison-based
+sorting programs that are composed of nested loops. We specify a
+.
+ﬂowgraph template Rflow
+= ∗(∗(◦)) and a computation template
+Rcomp that limits the operations to swapping of array values.
+
+• Rstack
+
+.
+= ∅: The synthesizer produces two sorting programs
+that are valid with respect to the scaffold. One corresponds to
+Bubble Sort and the other is a non-standard version of Insertion
+Sort. The standard version of Insertion Sort uses a temporary
+variable to hold the inserted object. Since we do not provide a
+temporary variable, the synthesized program moves the inserted
+element by swapping it with its neighbor, while still performing
+operations similar to Insertion Sort.
+
+.
+= {(int, 1)}: The synthesizer produces another sorting
+program that uses the temporary variable to hold an array index.
+This program corresponds to Selection Sort and is shown in Fig-
+ure 2(b). Notice the non-trivial invariants and ranking functions
+that are synthesized alongside for each of the loops.
+
+• Rstack
+
+Recursive divide-and-conquer sorting Consider comparison-
+based sorting programs that use recursion. We make a few simple
+modiﬁcations to the system to specify recursive programs. First, we
+introduce a terminal string “~” to the ﬂowgraph template language
+(Eq. 2), representing a recursive call. Let (Fpre( ~vin), Fpost( ~vout))
+denote the functional speciﬁcation. Then we augment the expan-
+sion (Section 3.2) to handle the new ﬂowgraph string as follows:
+Expandn(~) = choose{[]true → srecur}
+
+0) ⇒ Fpost( ~vout
+
+00))∧sret sets val-
+where srecur = sargs ∧(Fpre( ~vin
+ues to the arguments of the recursive call (using sargs), assumes the
+00), with
+0) ⇒ Fpost( ~vout
+effect of the recursive call (using Fpre( ~vin
+0 and the return variables re-
+the input arguments renamed to ~vin
+00) and lastly, outputs the returned values into program
+named to ~vout
+variables (using sret). The statements sargs, sret take the form:
+0, ei ∈ Dexp|Vars
+i xi = ei where xi ∈ ~vin
+i xi = ei where xi ∈ Vars, ei ∈ Dexp| ~vout
+
+sargs = V
+sret = V
+
+00
+
+Here Vars denote the variables of the procedure (the input, output
+and local stack variables). We also tweak the statement concretiza-
+
+tion function (Section 4) to output a recursive call statement rec:
+
+Stmt(Fpre( ~vin
+
+0) ⇒ Fpost( ~vout
+
+00)) = ~vout
+
+00 := rec( ~vin
+
+0)
+
+We specify a computation template that allows only swapping or
+moving of elements. We then try different values of the ﬂowgraph
+and stack templates:
+
+• Rflow
+
+.
+= ~;~;◦ (two recursive calls followed by an acyclic
+.
+fragment) and Rstack
+= ∅: The synthesizer produces a program
+that recursively sorts subparts and then combines the results.
+This corresponds to Merge Sort.
+
+.
+= ◦;~;~ (an acyclic fragment followed by two recursive
+.
+calls) and Rstack
+= {(int, 1)}: The synthesizer produces a
+program that partitions the elements and then recursively sorts
+the subparts. This corresponds to Quick Sort.
+
+• Rflow
+
+5.4 Dynamic Programming Algorithms
+For this category, we pick Dprf to be the theory supported by VS3
+AX,
+which we use as our solver. As in the previous section, since our
+tool does not currently infer predicates, we give it a candidate set.
+We choose all the textbook dynamic programming examples [8]
+and attempt to synthesize them from their functional speciﬁcations.
+The ﬁrst hurdle (even for veriﬁcation) for these algorithms is
+that the meaning of the computation is not easily speciﬁed. To
+address this issue, we need support for axioms, which are typically
+recursive deﬁnitions.
+
+Deﬁnitional Axioms The veriﬁcation tool allows the user to de-
+ﬁne the meaning of a computation as an uninterpreted symbol, with
+(recursive) quantiﬁed facts deﬁning the semantics of the symbol ax-
+iomatically. For example, the semantics of Fibonacci are deﬁned in
+terms of the symbol Fib and the three axioms:
+
+Fib(0) = 0 ∧ Fib(1) = 1
+∀k : k ≥ 0 ⇒ Fib(k + 2) = Fib(k + 1) + Fib(k)
+The tool passes the given symbol and its deﬁnitional axioms to the
+underlying theorem prover (Z3 [10]), which assumes the axioms
+before every theorem proving query. With this interpretation of the
+symbol Fib known to the theorem prover, the veriﬁer can now pose
+theorem proving queries involving the symbol Fib. For instance,
+the iterative program for Fibonacci maintains an invariant of the
+form x = Fib(i), which the veriﬁer can now infer. This allows the
+tool to verify dynamic programming programs that are typically
+iterative, relating them to the recursive deﬁnitional axioms.
+
+Even with veriﬁcation in place, automatic synthesis of these
+programs involves three non-trivial tasks for the synthesizer. First,
+the synthesizer needs to automatically discover a strategy for
+translating the recursion (in the functional speciﬁcation) to non-
+recursive iteration (for the actual computation). The functional
+speciﬁcations do not contain this information, e.g., in the speciﬁca-
+tion for Fibonacci above, the iteration strategy for the computation
+is not evident. Second, the synthesizer needs to take the (non-
+directional) equalities in the speciﬁcations and impose directional-
+ity such that elements are computed in the right order. For example,
+for Fibonacci the synthesizer needs to automatically discover that
+Fib(k) and Fib(k + 1) should be computed before Fib(k + 2).
+Third, the synthesizer needs to discover an efﬁcient memoization
+strategy for only those results needed for future computations, to ﬁt
+the computation in the space provided—which is one of the bene-
+ﬁts of dynamic programming algorithms. For example, Fibonacci
+can be computed using only two additional memory locations by
+suitable memoization. Fortunately, just by specifying the resource
+constraints and using our proof-theoretic approach the synthesizer
+is able to perform these tasks and synthesize dynamic programming
+algorithms from their recursive functional speciﬁcations.
+
+Also, as in the case of sorting, we want to disallow completely
+arbitrary computations. In sorting, we could uniformly restrict the
+
+expression language to only swap and move operations. For dy-
+namic programming, the speciﬁcation of the operations is problem-
+speciﬁc. For instance, for shortest path, we only want to allow the
+path matrix updates that correspond to valid paths, e.g., disallow
+arbitrary multiplication of path weights. Rcomp speciﬁes these con-
+straints by only permitting updates through certain predicates.
+
+Dynamic programming solutions typically have an initialization
+phase (init-loop) and then a phase (work-loop) that ﬁlls the appro-
+priate entries in the table. Therefore, we chose a Rflow with an init-
+loop (∗(◦)) followed by a work-loop.
+
+By specifying a ﬂowgraph template Rflow
+
+.
+= ∗(◦);∗(◦) and a
+stack template with no additional variables (except for the case of
+.
+Fibonacci, where the synthesizer required Rstack
+= {(int, 2)}),
+we were able to synthesize the following four examples:
+
+Fibonacci Consider computing the nth Fibonacci number from
+the functional speciﬁcation as above. Our synthesizer generates
+a program that memoizes the solutions to the two subproblems
+Fib(i1) and Fib(i1 + 1) in the i1th iteration. It maintains a sliding
+window for the two subproblems and stores their solutions in the
+two additional stack variables. The synthesized program along with
+its invariant and ranking function is shown in Figure 2(c).
+
+Checkerboard Consider computing the least-cost path in a rect-
+angular grid (with costs at each grid location), from the bottom
+row to the top row. The functional speciﬁcation states the path cost
+for a grid location in terms of the path costs for possible previous
+locations (i.e., below left, below or below right). Our synthesizer
+generates a program that ﬁnds the minimum cost paths.
+
+Longest Common Subsequence (LCS) Consider computing the
+longest common substring that appears in the same order in two
+given input strings (as arrays of characters). The recursive func-
+tional speciﬁcation relates the cost of a substring against the cost
+of substrings with one fewer character. Our synthesizer generates a
+program for LCS.
+
+Single Source Shortest Path Consider computing the least-cost
+path from a designated source to all other nodes where the weight
+of edges is given given as a cost function for each source and
+destination pair. The recursive functional speciﬁcation states the
+cost structure for all nodes in terms of the cost structure of all nodes
+if one fewer hop is allowed. Our synthesizer generates a program
+for the single source shortest path problem.
+
+For the following two examples, synthesis failed with the sim-
+pler work-loop, but we synthesize the examples by specifying a
+ﬂowgraph template ∗(◦);∗(∗(◦)) and no additional stack variables:
+
+All-pairs Shortest Path Consider computing all-pairs shortest
+paths using a recursive functional speciﬁcation similar to the one
+we used for single source shortest path. Our synthesizer times out
+for this example. We therefore attempt synthesis by (i) specifying
+the acyclic fragments and synthesizing the guards, and (ii) spec-
+ifying the guards and synthesizing the acyclic fragments. In each
+case, our synthesizer generates the other component, corresponding
+to Floyd-Warshall’s algorithm.
+
+Matrix Chain Multiply Consider computing the optimal way to
+multiply a matrix chain. Depending on the bracketing, the total
+number of multiplications varies. We wish to ﬁnd the bracketing
+that minimizes the number of multiplications. E.g., if we use the
+simple n3 multiplication for two matrices, then A10×100B100×1C1×50
+can either takes 1,500 multiplications for (AB)C or 55,000 mul-
+tiplications for A(BC). The functional speciﬁcation deﬁnes the
+cost of multiplying a particular chain of matrices in terms of the
+cost of a chain with one fewer element. Our synthesizer generates
+a program that computes the optimal matrix bracketing.
+
+Benchmark
+Swap two
+Strassen’s
+Sqrt (linear search)
+Sqrt (binary search)
+Bresenham’s
+
+maxcnj
+0
+0
+4
+3
+6
+
+maxbv
+2, 6
+2, 6
+2, 6
+2, 8
+2, 5
+
+Assumes
+0
+0
+0
+2
+0
+
+Table 1. Parameters used for synthesis using VS3
+QA. For each bench-
+mark, we list the maximum number of conjuncts in any invariant
+(maxcnj) and bit vector sizes (maxbv, for constants and for bit-
+blasting), respectively. The last column lists any assumes we man-
+ually speciﬁed.
+
+Benchmark
+
+Bubble Sort
+Insertion Sort
+Selection Sort
+Merge Sort
+Quick Sort
+Fibonacci
+Checkerboard
+Longest Common Subseq.
+Matrix Chain Multiply
+Single-Src Shortest Path
+All-pairs Shortest Path
+
+Defn.
+Axioms
+0
+0
+0
+0
+0
+3
+5
+6
+7
+3
+10
+
+Number of
+Templates,
+Predicates
+3, 17
+3, 16
+3, 20
+4, 16
+3, 15
+1, 12
+2, 8
+2, 13
+2, 18
+3, 16
+4, 19
+
+Annot. or
+Assumes
+1
+1
+1
+3
+0
+0
+0
+0
+0
+0
+0
+
+Table 2. Parameters used for synthesis using VS3
+AX. For each bench-
+mark, we list the number of deﬁnitional axioms required to specify
+the meaning of the computation. Additionally, we list the number
+of invariant templates and size of predicate set given to VS3
+AX. The
+last column lists any annotations or assumes we manually speciﬁed.
+
+QA and VS3
+
+5.5 Performance
+Parameters for VS3
+AX Table 1 lists the parameters re-
+quired to run VS3
+QA over our arithmetic benchmarks. The second
+column lists the maximum number of conjuncts (maxcnj) expected
+in each invariant. The third column lists the bit vector sizes (maxbv)
+used for invariant coefﬁcients and intermediate values. The last col-
+umn lists the assumptions we manually provided.
+
+We guessed reasonable values for maxcnj for the programs with
+loops. We started with a small value and iteratively increased it if
+synthesis failed. For the bit-vector sizes, we choose two bits for
+the coefﬁcients since we were not expecting large coefﬁcients in
+the invariants. We then chose reasonable values (5–8) for the bit-
+vector size for intermediate computations. There was only one case,
+square root using binary search, where we had to specify a manual
+assertion, as discussed earlier. In all, little user effort was required.
+AX over our sort-
+ing and dynamic programming benchmarks. The second column
+lists the number of deﬁnitional axioms required for specifying the
+meaning of the computation and are required even for veriﬁcation.
+The third column lists the number of templates and predicates used.
+The last column lists the number of annotations or assumptions that
+were manually provided.
+
+Table 2 lists the parameters required to run VS3
+
+The templates contain conjunctive holes and explicit quantiﬁca-
+tion and disjunction. For each benchmark, there is one quantiﬁer-
+free, disjunction-less, template and the remaining are universally
+quantiﬁed with a form almost identical to the postcondition, and
+therefore easy to write out. All invariants are conjunctions of the
+templates with their holes instantiated with a subset (conjunction)
+of the predicate set. The predicates are atomic relations between
+linear and array expression over program variables and constants.
+We specify a suitable predicate set for each benchmark. We start
+with a candidate set and then iteratively added predicates when syn-
+
+Benchmark
+
+A
+3Q
+S
+V
+(
+
+) Swap two
+Strassen’s
+Sqrt (linear search)
+Sqrt (binary search)
+Bresenham’s
+) Bubble Sort
+
+.
+h
+t
+i
+r
+
+A
+
+A
+3P
+S
+V
+(
+
+g
+n
+i
+t
+r
+o
+S
+
+Insertion Sort
+Selection Sort
+Merge Sort
+Quick Sort
+) Fibonacci
+
+X
+3A
+S
+V
+(
+
+.
+g
+o
+r
+P
+c
+i
+m
+a
+n
+y
+D
+
+Checkerboard
+Longest Common Subseq.
+Matrix Chain Multiply
+Single-Src Shortest Path
+All-pairs Shortest Path1
+
+Verif.
+0.11
+0.11
+0.84
+0.63
+166.54
+1.27
+2.49
+23.77
+18.86
+1.74
+0.37
+0.39
+0.53
+6.85
+46.58
+
+112.28
+
+Synthesis
+0.12
+4.98
+9.96
+1.83
+9658.52
+3.19
+5.41
+164.57
+50.00
+160.57
+5.90
+0.96
+14.23
+88.35
+124.01
+(i) 226.71
+(ii) 750.11
+
+Ratio
+1.09
+45.27
+11.86
+2.90
+58.00
+2.51
+2.17
+6.92
+2.65
+92.28
+15.95
+2.46
+26.85
+12.90
+2.66
+(i) 2.02
+(ii) 6.68
+
+Table 3. (a) Arithmetic (b) Sorting (c) Dynamic Programming. For
+each category, we indicate the tool used both for veriﬁcation and
+synthesis. For each benchmark, we indicate the time in seconds to
+solve the veriﬁcation conditions and the synthesis conditions, and
+the slowdown for synthesis compared to veriﬁcation.
+
+thesis failed. We needed at most 20 predicates, which were easily
+found for each benchmark. In the interest of space, we omit the
+exact templates and predicates used for each benchmark, but they
+can be found in the companion technical report [35]. For each of
+the sorting programs with a nested loop structure (Bubble, Inser-
+tion and Selection Sort), the outer loop invariant is redundant given
+the inner loop invariant. Therefore, we tag the outer loop—the one
+annotation each case—and the solver does not to attempt to gener-
+ate its invariant, improving performance. For Merge Sort, synthe-
+sis fails unless we reduce the search space by manually specifying
+three simple quantiﬁer-free atomic facts of the invariant. In all, little
+user effort was required.
+
+Runtimes Table 3 presents the performance of a constraint-based
+synthesizer over arithmetic, sorting and dynamic programming
+benchmarks using the parameters from Tables 1 and 2. All run-
+times are median of three runs, measured in seconds. We measure
+the time for veriﬁcation and the time for synthesis using the same
+tool. The total synthesis time varies between 0.12–9658.52 sec-
+onds, depending on the difﬁculty of the benchmark, with a median
+runtime of 14.23 seconds. The factor slowdown for synthesis varies
+between 1.09–92.28 with a median of 6.68.
+
+The benchmarks we used are considered difﬁcult even for veri-
+ﬁcation. Consequently the low average runtimes for proof-theoretic
+synthesis are encouraging. Also, the slowdown for synthesis com-
+pared to veriﬁcation is acceptable, and shows that we can indeed
+exploit the advances in veriﬁcation to our advantage for synthesis.
+
+5.6 Limitations and Future Work
+
+Our synthesis system borrows the limitations of the underlying ver-
+iﬁers. Speciﬁcally, we added assumptions for two cases, binary
+search square root and merge sort, to compensate for the incom-
+plete handling of quadratic expressions by VS3
+QA and inefﬁciency
+of VS3
+AX, respectively. Similarly, we have to specify a set of can-
+didate predicates for VS3
+AX—an overhead that can be alleviated us-
+ing predicate inference techniques. For our experiments, this meant
+that at times, our guesses were not sufﬁcient, and synthesis only
+succeeded after a ﬁrst few failed attempts which were used to iter-
+atively reﬁne the set of predicates, akin to a manual run of CE-
+
+1 These timings are for separately (i) synthesizing the loop guards, and for
+(ii) synthesizing the acyclic fragments.
+
+GAR [4]. Aside from these avoidable incompleteness issues of
+veriﬁers, there are two major concerns for any synthesis system,
+namely scalability and relevance.
+
+Scalability The synthesis conditions we generate are tractable for
+current solvers, even though these benchmarks are considered some
+of the most difﬁcult even to verify. Yet, the synthesis conditions
+are not trivial, as illustrated by the need to annotate three of the
+sorting benchmarks to omit invariants for their outer loops. With
+the current system we expect to be able to synthesize programs that
+have more lines of code, but for which the reasoning involved is not
+as complicated as in our benchmarks. But to synthesize programs
+that are larger and involve more complicated reasoning, more
+efﬁcient veriﬁers are needed.
+
+Relevance Any solution to the synthesis conditions is a valid
+terminating program that satisﬁes the scaffold speciﬁcation. But
+there may be multiple valid ones that may differ, for instance, in
+cache behavior, runtime performance, or readability. Currently, we
+do not prioritize the synthesized programs in any manner, but for
+completeness we let the solver enumerate solutions. To get another
+solution, we assert the negation of a solution generated in a step
+and iteratively ask for the next solution. Notice though that the
+synthesis times reported in Table 3 are for generating the ﬁrst
+of those solutions. We envision that in the future, we can either
+augment synthesis conditions with constraints about relevance or
+use a postprocessing step to prioritize and pick relevant solutions
+from those enumerated.
+
+6. Related Work
+Proof-theoretic program synthesis Dijkstra [14], Gries [18] and
+Wirth [38] advocated that programmers write program that are
+correct-by-construction by manually developing the proof of cor-
+rectness alongside the program. Because techniques for efﬁcient
+invariant inference were unavailable in the past, synthesis was con-
+sidered intractable [12]. Recently, scheme-guided synthesis [17]
+has been proposed but specialized to the arithmetic domain [5].
+Categorizations of approaches as constructive/deductive synthesis,
+schema-guided synthesis and inductive synthesis are presented in
+a recent survey [1]. Our approach can be seen as midway be-
+tween constructive/deductive synthesis and schema-guided synthe-
+sis. Some researchers proposed heuristic techniques for automa-
+tion, but they cater to a very limited schematic of programs are
+limited in their applicability [15]. In this paper, we have shown that
+veriﬁcation has reached a point where automatic synthesis is feasi-
+ble.
+
+Extracting program from proofs The semantics of program
+loops is related to mathematical induction. There, an inductive
+proof of the theorem induced by a program speciﬁcation can be
+used to extract a program [27]. Using signiﬁcant human input, the-
+orems proved interactively in the Coq have a computational analog
+that can be extracted [2]. The difﬁculty is that the theorem is of
+the whole program, and proves that an output exists for the spec-
+iﬁcation. Such a theorem is much more difﬁcult than the simple
+theorem proving queries generated by the veriﬁcation tool.
+
+Sketching Instead of a declarative speciﬁcation of the desired
+computation as we use, combinatorial sketching [29, 30, 31] uses
+an unoptimized program as the speciﬁcation. A model checker
+eliminates invalid candidate programs that the synthesizer gener-
+ates. Loops are handled in a novel but incomplete manner, by un-
+rolling, or by using a predeﬁned skeleton, or by using domain spe-
+ciﬁc loop ﬁnitization tricks [29] that are not applicable when syn-
+thesizing true unbounded loops (which our approach synthesizes
+naturally using safety and liveness constraints). Sketching does not
+
+inherently generate the proof, although postprocessing steps can
+ensure correctness [30], while our approach produces the program,
+and the proof.
+
+Model checking-based synthesis of automata Seminal work
+on model checking [3] proposed synthesizing synchronization
+skeletons—a problem that has recently seen renewed interest [36,
+37]. Synthesis from LTL speciﬁcation has also been consid-
+ered [28]. For the case of reactive systems, proposals exist that
+reduce the synthesis problem to a game between the environment
+and the synthesizer where the winning strategy corresponds to the
+synthesized program. Recently, this approach has also been ap-
+plied to program repair [25, 19], which can be seen as restricted
+program synthesis. Despite optimizations [24], the practicality of
+these approaches for complete program synthesis remains unclear.
+
+7. Conclusions
+We have presented a principled approach to synthesis that treats
+synthesis as a generalized veriﬁcation problem. The novelty of
+our approach lies in generating synthesis conditions, which are
+composed of safety conditions, well-formedness conditions, and
+progress conditions, such that a satisfying solution to the syn-
+thesis conditions corresponds to a synthesized program. We have
+been able to use veriﬁcation tools to synthesize programs, and, si-
+multaneously, their proof (invariants, ranking functions). We have
+demonstrated the viability of our approach by synthesizing difﬁ-
+cult examples in the three domains of arithmetic, sorting, and dy-
+namic programming, all in very reasonable time. We believe the
+reason for the practicality of our approach is the interplay between
+the proof (invariants) and the statements. Speciﬁcally, by setting
+up constraints with both statement and proof unknowns together,
+statements that do not have a corresponding proof are efﬁciently
+eliminated. We believe this is the ﬁrst proposal that leverages this
+insight for efﬁcient and automatic program synthesis.
+
+Acknowledgments
+This work was supported in parts by the grants CCF-0430118 and
+CCF-0346982. We would also like to thank Avik Chaudhuri, El-
+natan Reisner, and the other anonymous reviewers, for their invalu-
+able feedback.
+
+References
+
+[1] D. Basin, Y. DeVille, P. Flener, A. Hamfelt, and J. F. NIlsson.
+Synthesis of programs in computational logic. In LNCS 3049.
+
+[2] Yves Bertot and Pierre Casteran. Interactive Theorem Proving and
+
+Program Development. SpringerVerlag, 2004.
+
+[3] Edmund M. Clarke and E. Allen Emerson. Design and synthesis of
+synchronization skeletons using branching-time temporal logic. In
+Logic of Programs, pages 52–71. Springer-Verlag, 1982.
+
+[4] Edmund M. Clarke, Orna Grumberg, Somesh Jha, Yuan Lu, and
+Helmut Veith. Counterexample-guided abstraction reﬁnement. In
+CAV ’00, pages 154–169, 2000.
+
+[5] Michael Col´on. Schema-guided synthesis of imperative programs by
+
+constraint solving. In LOPSTR, pages 166–181, 2004.
+
+[6] Michael Col´on, Sriram Sankaranarayanan, and Henny Sipma. Linear
+invariant generation using non-linear constraint solving. In CAV’03.
+
+[7] Byron Cook, Andreas Podelski, and Andrey Rybalchenko. Termina-
+tion proofs for systems code. In PLDI ’06, pages 415–426, 2006.
+
+[8] T. Cormen, C. Leiserson, and R. Rivest. Introduction to Algorithms.
+
+[9] P. Cousot and R. Cousot. Abstract interpretation a uniﬁed lattice
+
+model for static analysis of programs by construction or approxima-
+tion of ﬁxpoints. In POPL’77.
+
+[10] Leonardo de Moura and Nikolaj Bjørner. Z3, 2008. http://
+
+research.microsoft.com/projects/Z3/.
+
+[11] Edsger W. Dijkstra. Guarded commands, nondeterminacy and formal
+derivation of programs. Communications of the ACM, 18(8):453–457.
+
+[12] Edsger W. Dijkstra. A constructive approach to the problem of
+
+program correctness. BIT Numerical Math., 8(3):174–186, 1968.
+
+[13] Edsger W. Dijkstra and Carel S. Scholten. Predicate Calculus and
+
+Program Semantics. Texts and Monographs in CS. 1990.
+
+[14] Edsger Wybe Dijkstra. A Discipline of Programming. 1976.
+
+[15] Joe W. Duran. Heuristics for program synthesis using loop invariants.
+
+In ACM ’78, pages 891–900, New York, NY, USA. ACM.
+
+[16] Jean-Christophe Filliˆatre. Using SMT solvers for deductive
+
+veriﬁcation of C and Java programs. In SMT’08.
+
+[17] Pierre Flener, Kung-Kiu Lau, Mario Ornaghi, and Julian Richardson.
+An abstract formalization of correct schemas for program synthesis.
+J. Symb. Comput., 30(1):93–127, 2000.
+
+[18] David Gries. The Science of Programming. 1987.
+
+[19] Andreas Griesmayer, Paul Bloem Roderick, and Byron Cook. Repair
+
+of boolean programs with an application to C. In CAV’06.
+
+[20] Sumit Gulwani, Saurabh Srivastava, and Ramarathnam Venkatesan.
+Constraint-based invariant inference over predicate abstraction. In
+VMCAI’09.
+
+[21] Sumit Gulwani, Saurabh Srivastava, and Ramarathnam Venkatesan.
+Program analysis as constraint solving. In PLDI ’08, pages 281–292.
+
+[22] Matthew S. Hecht and Jeffrey D. Ullman. Flow graph reducibility. In
+STOC ’72, pages 238–250, New York, NY, USA, 1972. ACM.
+
+[23] Thomas A. Henzinger, Ranjit Jhala, Rupak Majumdar, and Kenneth L.
+
+McMillan. Abstractions from proofs. In POPL ’04, 2004.
+
+[24] Barbara Jobstmann and Roderick Bloem. Optimizations for LTL
+synthesis. In FMCAD ’06, pages 117–124. IEEE Computer Society.
+
+[25] Barbara Jobstmann, Andreas Griesmayer, and Roderick Paul Bloem.
+
+Program repair as a game. In CAV’05, pages 226 – 238.
+
+[26] Shuvendu Lahiri and Shaz Qadeer. Back to the future: revisiting
+precise program veriﬁcation using SMT solvers. In POPL ’08.
+
+[27] Zohar Manna and Richard J. Waldinger. Toward automatic program
+synthesis. Communications of the ACM, 14(3):151–165, 1971.
+
+[28] A. Pnueli and R. Rosner. On the synthesis of a reactive module. In
+
+POPL ’89, pages 179–190, New York, NY, USA. ACM.
+
+[29] Armando Solar-Lezama, Gilad Arnold, Liviu Tancau, Rastislav
+
+Bodik, Vijay Saraswat, and Sanjit Seshia. Sketching stencils.
+PLDI ’07, pages 167–178, New York, NY, USA. ACM.
+
+In
+
+[30] Armando Solar-Lezama, Christopher Grant Jones, and Rastislav
+
+Bodik. Sketching concurrent data structures. In PLDI ’08.
+
+[31] Armando Solar-Lezama, Rodric Rabbah, Rastislav Bod´ık, and Kemal
+Ebcio˘glu. Programming by sketching for bit-streaming programs. In
+PLDI ’05.
+
+[32] Saurabh Srivastava and Sumit Gulwani. Program veriﬁcation using
+
+templates over predicate abstraction. In PLDI ’09.
+
+[33] Saurabh Srivastava, Sumit Gulwani, and Jeffrey S. Foster. VS3.
+
+http://www.cs.umd.edu/~saurabhs/pacs/.
+
+[34] Saurabh Srivastava, Sumit Gulwani, and Jeffrey S. Foster. VS3: SMT
+
+solvers for program veriﬁcation. In CAV ’09.
+
+[35] Saurabh Srivastava, Sumit Gulwani, and Jeffrey S. Foster. Proof-
+theoretic program synthesis: From program veriﬁcation to program
+synthesis. Technical report, Microsoft Research, Redmond, 2009.
+
+[36] Martin Vechev, Eran Yahav, and Greta Yorsh. Inferring synchroniza-
+
+tion under limited observability. In TACAS’09, 2009.
+
+[37] Martin Vechev, Eran Yahav, and Greta Yorsh. Abstraction-guided
+
+synthesis. In POPL’10, 2010.
+
+[38] Nicholas Wirth. Systematic Programming: An Introduction. 1973.
+
+

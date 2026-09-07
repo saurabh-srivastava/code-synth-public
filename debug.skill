@@ -1,0 +1,1341 @@
+# debug.skill
+
+Debugging guide for the proof-theoretic synthesizer in this repo.
+Audience: a future LLM (or human) who's driving the synthesizer and
+something has gone wrong.  Companion to `problem.skill`, which
+covers happy-path input authoring.
+
+This file is updated as new debugging patterns surface.  See
+`CONTRIBUTING.md`'s "Phase-completion routine" for the upkeep
+workflow.
+
+**Governing principles** (P-1 through P-4) and **always-on
+reminders** (A-1 through A-4) live in
+[`PRINCIPLES.md`](./PRINCIPLES.md).  Especially relevant when
+debugging:
+- **P-3** — if Z3 is producing spurious SAT or UNKNOWN on
+  quantified-array atoms, add the dummy `axioms=["0 == 0"]`
+  trip-wire.
+- **A-1** — non-trivial Lean proofs should be iterated in a
+  scratch `.lean` file first, not in `Helpers.lean`.
+
+---
+
+## Quick triage
+
+Match the symptom to the likely cause before you start digging:
+
+| Symptom | Most likely cause | Section |
+| --- | --- | --- |
+| `solve()` returns `NoSolution` ("unsat") | Predicate space too narrow; an essential atom is missing from some hole | "UNSAT debugging" |
+| `solve()` returns `Timeout` | Predicate space too large; too many atoms in some τ hole; quantified atoms compounding | "Timeout debugging" |
+| Returns sound but unwanted code | Spec underspecified (see `problem.skill` REC 5) | "Spec underspecification" |
+| Returns code with a degenerate atom (non-decreasing recur, missing guard coverage, …) | Soundness regression — a constraint that should reject this is missing in some context | "Soundness signals" |
+| `emit_c()` output fails `clang -Werror` | Emitter pattern not yet handled, or coverage constraint missing | "Emitter debugging" |
+| Emitted C compiles but infinite-loops at runtime | Synthesizer accepted an unsound solution (coverage / decrease constraint missing) | "Soundness signals" |
+| Benchmark fast in isolation, slow in suite | Stale child processes from earlier runs eating CPU | "Process hygiene" |
+| Test passes alone, fails after another test | Z3 nondeterminism flipped solution preference under solver load | "Z3 nondeterminism" |
+| `NoSolution(reason="unsat")` with "valid per-class but globally inconsistent" hint | τ-atom gap on bundle-post; OR missing helper coverage on a soundness-critical constraint | "Soundness signals" — Signals 6 and 8 |
+| Lean dispatch error referencing `ranking-*` / empty-τ | Spurious Z3 cross-check via `_on_z3_sat` on a kind that should skip it | "Helper-citation codegen" |
+| Synthesis wall-clock blew up after a routing change | Routed a non-axiom-heavy kind onto Lean dispatch; revert | "Helper-citation codegen" |
+| Synthesized solution carries the FULL τ atom set (no minimization) | Helper short-circuit emits full-τ cube only; expected behavior | "Helper-citation codegen" |
+| Synth wedges with NO output (not even XFAIL header dump count) on a benchmark with `ForAll(...)` τ atoms but no UFs | Direct quantifier in τ + no UF/axiom → `_axiom_heavy_lean_path=False`, Z3 stays on quantified reasoning and wedges | "Encoding: quantifier-in-τ vs UF-with-axioms" |
+| `cost-*` UNSAT or wall-clock blowup on a cost-bound benchmark | Cost-atom candidate too tight; quadratic cost trips Z3 NIA; or `CostLemmas` import is missing on the dispatch path | "Cost-invariant debugging" |
+| Chain-aware Lean validates classes Z3 doesn't (silent unsoundness) | Translator hypothesis set diverges from Z3 constraint's antecedents — lesson #66, especially after a constraints.py change | "Lean / Z3 obligation parity" |
+| UNSAT with hint mentioning an input fact (`n >= 0`, `is_bipartite(G)`, ...) being unreachable in an inner inductive | Pre-K.D missing-Fpre symptom — should be auto-fixed now.  If still seen, the gap is elsewhere | "Fpre propagation (K.D)" |
+| Helper short-circuit silently skipped on a constraint despite the helper validating in isolation | `sc.atom_refs` is empty (often happens for second+ Cartesian path through a chain with multi-branch SBs).  `_extract_loop_id(sc)` falls back to atom_refs → returns None → helper gate fails | "Helper short-circuit not firing (Slice 2.B)" |
+| Procedure-level multi-branch SB(n>1) coverage UNSATs on an axiom-heavy benchmark | Solver routing pre-Slice 2.B excluded `coverage` with `loop_id=None` from axiom-heavy Lean dispatch.  Should be auto-fixed (lesson #72).  Verify via `git log synth/solver.py` | "Helper-citation codegen" / lesson #72 |
+| Identity-args tail recursion synthesizes the recur but ranking-decrease body is `x > x` (always false) | The args expression equals the in_b state, so `phi(in_b) > phi(args)` collapses.  Workaround: add an explicit `k: int` iteration budget input with `phi@PROC = k`, `args.k = k - 1` | problem.skill REC 15 |
+| Helper cite fails with `unknown identifier` referencing a binder name like `n_s0` or `u'` | FLAT vs chain-aware helper signature dispatch mismatch — the helper was written for one shape but the translator emits the other.  Rule: FLAT if chain prefix to target has only SB items; chain-aware otherwise | "Helper signature dispatch (Slice 2.C)" |
+| Concretizing a `IsMatching` UF to atomic τ atoms — flip-preserves-IM proof fails to close | Predicate is missing the `no_self` atom (`M[k] != k` for matched k); 3-atom predicate is unsoundly weak.  Add `M[k] != k` and re-attempt the proof | "Concrete-predicate audit (Slice 2.C)" / problem.skill REC 16 |
+| `NoSolution(reason="needs-helpers")` at safety-bundle-post with τ subset enumeration | Helper's `required_atoms` doesn't match the FULL subset the enumeration picks (declared empty/partial; or supplies fewer atoms than the helper proof actually needs) | "Helper-citation codegen" Signal 7.5 / lesson #78 |
+
+---
+
+## Soundness signals
+
+The bug class we've found most often.  The synthesizer's verification
+machinery proves correctness *under the constraints it emits*.  If a
+constraint that should apply at some context isn't emitted, an
+unsound solution slips through silently — verified by the SAT layer
+but corresponding to a program that doesn't actually compute the
+spec.  See Lesson #27 in `CLAUDE.md`.
+
+### Signal 1 — solution count jumps
+
+If a benchmark used to return N solutions and suddenly returns N+k
+solutions after a refactor, especially if the new solutions look
+*cheaper by score* (fewer operators, constant ranking, no
+transitions, …), the framework just dropped a constraint emission.
+
+This is the cheapest soundness check the regression suite gives
+you.  Watch for it.
+
+To diagnose:
+
+```python
+result = solve(problem)
+for n, sol in enumerate(result.solutions):
+    print(f"sol#{n} (score={sol.score}):")
+    for k, v in sorted(sol.atoms.items()):
+        print(f"  {k}: {v}")
+```
+
+Identify the unsound atom — typically you'll see something like
+`{"_recur": True, "args": {"n": "n"}, ...}` (non-decreasing args)
+or branch guards that don't cover all states.  Then ask: where
+*should* the constraint that rejects this be emitted?
+
+### Signal 2 — runtime checks via the Python emitter
+
+The fastest way to find out whether a synthesized solution is
+actually sound is `emit_py(..., runtime_check=True)` followed by
+calling the function on a sample input.  Every pre / post /
+invariant / decrease / lower-bound / coverage obligation becomes
+an executable check that raises `ProofViolation` (an
+`AssertionError` subclass) on failure.
+
+```python
+from synth import solve, emit_py
+result = solve(problem)
+code = emit_py(result.best, problem, fname="proc", runtime_check=True)
+ns = {}
+exec(compile(code, "<gen>", "exec"), ns)
+try:
+    ns["proc"](some_input)
+except Exception as e:
+    print(f"{type(e).__name__}: {e}")  # ProofViolation: decrease: ... (prev=1, curr=2)
+```
+
+When a `ProofViolation` fires, the `kind` field tells you which
+obligation failed (`"pre"`, `"decrease"`, `"invariant"`, etc.) and
+the `details` tuple carries the offending values.  This narrows
+debugging much faster than the C emitter's compile + run (you see
+the obligation kind, not just a hang or wrong output).
+
+The runtime-check emitter is **also a soundness oracle** for the
+synthesizer itself: if the synthesizer chose an unsound `phi` or
+unsound branch guards, the runtime check exposes it on the first
+execution.  See the max_array Z3-UNKNOWN-acceptance case in
+CLAUDE.md (Phase 5.C entry) and `RESEARCH.md §O` proposal P2.
+
+### Signal 3 — compile + run reveals what symbolic verification missed
+
+The synthesizer's logical proof is no guarantee that the emitted C
+binary computes the spec.  Compile and run on a handful of inputs:
+
+```python
+import subprocess, tempfile
+from pathlib import Path
+from synth import solve, emit_c
+
+result = solve(problem)
+c = emit_c(result.best, problem, fname="prog")
+full = "#include <stdio.h>\n\n" + c + "\n\nint main(void){...; return 0;}\n"
+
+with tempfile.TemporaryDirectory() as d:
+    cp = Path(d) / "a.c"; cp.write_text(full)
+    ep = Path(d) / "a"
+    subprocess.run(["clang", "-Wall", "-Werror", "-o", str(ep), str(cp)],
+                   check=True)
+    rp = subprocess.run([str(ep)], capture_output=True, text=True,
+                        timeout=15)  # ← ALWAYS USE A TIMEOUT
+    print(rp.stdout)
+```
+
+Three failure modes:
+- **TimeoutExpired**: synthesized program has an infinite loop.
+  Coverage missing on SBs (the if/else chain falls through), or
+  non-decreasing recur args.  Don't skip the timeout — without it,
+  the test hangs and the diagnostic value is lost (Lesson #28).
+- **Nonzero exit code, empty stderr on macOS**: stack overflow from
+  deep recursion.  Per-procedure ranking decrease constraint not
+  enforced.
+- **Wrong stdout**: the synthesized program is logically valid for
+  the spec, but the spec underspecified.  See "Spec
+  underspecification" below.
+
+### Signal 4 — Z3 nondeterminism flips behavior
+
+A benchmark that works in isolation but fails when run after some
+other heavy benchmark is a classic signature: Z3's solver state has
+drifted (cached lemmas, model heuristics) and a *lower-score-but-
+unsound* solution is now preferred.
+
+Reproduce by:
+
+```python
+spec_a = importlib.util.spec_from_file_location("a", "benchmarks/heavy.py")
+mod_a = importlib.util.module_from_spec(spec_a)
+spec_a.loader.exec_module(mod_a)
+from synth import solve
+solve(mod_a.PROBLEM)  # warm up / pollute Z3 state
+
+# Now run the suspect benchmark — does it return a different best
+# solution than in isolation?
+spec_b = importlib.util.spec_from_file_location("b", "benchmarks/suspect.py")
+mod_b = importlib.util.module_from_spec(spec_b)
+spec_b.loader.exec_module(mod_b)
+print(solve(mod_b.PROBLEM).best.atoms)
+```
+
+If reproducible, a constraint that should reject the
+flipped-to solution is missing.  The fact that it passed in
+isolation was *luck* — Z3 happened to pick a sound solution
+when the search heuristic was fresh.
+
+### Signal 5 — Lean fallthrough dumps as a debugging lens
+
+For axiom-heavy benchmarks (problems with UFs or universal
+axioms), the synthesizer routes every soundness-critical
+attribute class through Lean — first a curated `.solved.lean`
+/ `.invalid.lean` cache lookup (signature-hash filenames in
+`lean/SynthLean/Y2Corpus/<bench>/`), then Lean's generic
+tactic chain.  On generic-chain failure, the obligation dumps
+to `<theorem>_<H>.failed.lean`.  Read the dumps to understand
+WHY a specific attribute class was hard:
+
+- **If the obligation is genuinely valid but `simp_all + aesop`
+  can't close it**, the τ subset just needs a hand-written
+  proof — file a `<stem>.solved.lean` companion alongside (same
+  hash).
+- **If the obligation is genuinely invalid** (τ subset omits a
+  load-bearing atom), the synthesizer correctly rejects it.
+  File a `<stem>.invalid.lean` companion that proves
+  `∃ vars, hyps ∧ ¬ goal` with concrete witnesses.
+
+The constraint kinds and translators:
+
+| Kind                      | Translator                       |
+| ---                       | ---                              |
+| `safety` (loop inductive) | `theorem_for_safety_inductive`   |
+| `safety-bundle-entry`     | `theorem_for_entry_bundle` (flat) / `theorem_for_entry_bundle_chain` (chain-aware, #167) |
+| `safety-bundle-post`      | `theorem_for_chain_bundle` (flat) / `theorem_for_chain_bundle_chain` (chain-aware, #167) |
+| `ranking-lb`              | `theorem_for_ranking_lb` (Z3 only — kept off Lean dispatch, see Signal 7.5) |
+| `ranking-decrease`        | `theorem_for_ranking_decrease` (Z3 only — see Signal 7.5) |
+| `coverage`                | `theorem_for_coverage` (Phase H.2.CODEGEN; SB(n>1) coverage via Lean omega/decide) |
+| `cost-lb`                 | `theorem_for_cost_lb` (Phase COST_INVS §2; opens `SynthLean.CostLemmas`) |
+| `cost-decrement`          | `theorem_for_cost_decrement` (SB body) / `theorem_for_cost_decrement_chain` (non-SB body) |
+| `cost-budget`             | top-level cost ≤ `cost_target`; Z3-side (linear arithmetic typically suffices) |
+
+For SB(n>1) loop bodies, `safety` and `ranking-decrease`
+constraints are per-branch (each tagged with `branch_idx`); the
+translator picks the branch's atoms.
+
+CI gate (`tests/test_y2corpus.py`) runs `lake env lean` on every
+committed companion to catch drift.  Full protocol in
+`lean/SynthLean/Y2Corpus/README.md`.
+
+**Stable failure-dump paths.**  `lake env lean` runs each
+obligation through a fresh tempfile (`/tmp/tmpXXX.lean`), and
+its stderr references that path.  The dumper
+(`synth/lean_backend/verify.py:_stable_stderr`) normalizes the
+tempfile reference to `<tmp>.lean` so committed
+`<theorem>_<H>.failed.lean` files stay diff-stable across runs.
+If you see `.failed.lean` churn in `git status` after a clean
+test run, suspect a regression in `_stable_stderr` (e.g., a new
+tempfile path pattern that the regex missed).
+
+**Hash CLI as a curation tool.**  When dump filenames don't
+match expectations (or when authoring a new benchmark's
+companions from scratch):
+
+```
+.venv/bin/python -m synth.lean_backend.hash benchmarks/<bench>.py
+```
+
+prints every `(sc_idx, kind, branch_idx, hash, expected_filename)`
+tuple for the benchmark's current obligations.  Pair with
+`--tau 'tau@L0=atom1;atom2;...'` to compute the hash for a
+specific τ subset rather than the synthesizer-picked one
+(semicolon-separated because some atom strings contain commas
+from UF calls).
+
+**Cache-hit overhead is real.**  Each `.solved.lean` cache hit
+invokes `lake env lean` via `_typecheck` (synth/lean_backend/verify.py).
+That's ~3-5s per hit on a warm mathlib cache, ~10s cold.  With
+100+ classes in a PLDI'09 enumeration, even all cache hits =
+several minutes of pure Lean overhead.  For axiom-heavy
+benchmarks (modular_exp, kadane), the dominant cost is the
+classes that DON'T hit the cache — each takes the full Lean
+tactic-chain timeout (15s) before being rejected under sound
+mode.  Total wall time for axiom-heavy synth with full cache:
+~15min minimum.  Without cache: synthesis wedges past 30min.
+
+If a benchmark wedges past 20 min even with a complete cache,
+likely causes:
+  - The PLDI'09 enumeration is hitting τ subsets the
+    synthesizer hasn't dumped (so no cache lookup) and they
+    all timeout in Lean's generic chain.
+  - Z3 is wedging on its own decidable checks (not Lean).
+    Check by running with `verify_fallback="reject"` to see
+    if Z3 alone is the bottleneck.
+
+### Signal 6 — "per-class valid but globally inconsistent"
+
+The solver hint reads:
+
+> valid attribute classes per constraint were found, but no
+> Boolean assignment satisfies all of them simultaneously
+> (after N attribute-class checks, T seconds).
+
+This means **each safety constraint has at least one τ-subset
+that validates it, but those subsets disagree** — atom A is
+required by constraint c1 but disallowed by c2.  Distinct from
+the more common "predicate space lacks the atoms needed" hint
+(no valid class for some single constraint).
+
+Common causes:
+- **Implies-style τ atoms with overlapping case-splits.**  E.g.,
+  τ contains `Implies(idx == -1, ϕ_search)` and `Implies(idx >= 0,
+  ϕ_found)`.  The inductive at one branch requires ϕ_search;
+  the inductive at another branch requires ϕ_found.  No single
+  subset satisfies both at the SAME pre-state.
+- **Loop ranking-decrease vs found-flag pattern.**  The
+  per-branch ranking-decrease constraint fires unconditionally;
+  if a branch sets a "found" flag without shrinking ϕ, that
+  branch's decrease class is empty even when other constraints
+  are happy.  See `binary_search.py`'s commented walkthrough.
+- **Conditional ϕ-expressions.**  `phi = (a - b) if cond else 0`
+  — Z3 sometimes doesn't simplify the conditional uniformly
+  across constraints, leading to per-class validity that
+  doesn't compose.
+- **τ-atom gap with bundle-post dependency.**  The bundle-post
+  ("loop exit ⇒ Post") needs derivability of Post from the
+  invariant.  If τ has `result ≥ 0` but the Post requires
+  `result == pow(b, e) % m` (which requires both `result ≥ 0`
+  AND `result < m`), the bundle-post has NO valid τ-subset
+  that proves Post.  Surfaces as per-class-valid-but-globally-
+  inconsistent because individual inductive constraints are
+  valid for some τ-subsets, but no τ-subset proves the
+  bundle-post.  Diagnosis: dump the failed bundle-post
+  obligation, read the goal, and check what additional facts
+  are needed to derive Post — those are missing τ atoms.
+  Worked example: `modular_exponentiation` (added `result < m`
+  to τ after the 1506s solo run showed sc7 dumps with τ-
+  insufficient hypotheses).
+
+Triage:
+1. Print system.safety by kind to see which constraints exist.
+2. Inspect each constraint's τ atom-requirements (which τ atoms
+   does its body reference?).
+3. Look at the bundle-post obligation's goal: is it derivable
+   from the conjunction of all your τ atoms + the pre + the
+   negated loop guard?  If not, you're missing τ atoms.
+4. Look for a constraint whose body mentions an atom that
+   another constraint's complement-class assumes must be False.
+5. Common fix: rephrase the template to avoid case-splitting τ.
+   For loop-with-witness specs, the 3-phase pattern
+   (`SB() >> Loop(SB) >> SB(n=k)`) often sidesteps the issue.
+   See `benchmarks/stretch/binary_search.py` for the worked
+   example.
+6. **Check helper coverage** (if the benchmark has a
+   `helper_registry`).  `SolveResult.hints` or `NoSolution.hints`
+   emits a "Helper coverage: N/M" line.  If a soundness-critical
+   constraint (especially bundle-post or coverage) has NO helper
+   covering the full-τ subset, the generic tactic chain may have
+   timed out on every enumerated subset for it.  The constraint
+   ends up with no valid class; global SAT fails.  Fix: write a
+   helper covering the full-τ case (mirror the FW / kadane /
+   modexp pattern).
+
+#### Reading per-sc V tallies vs global UNSAT (F15)
+
+The `[PROGRESS]` log emits per-constraint dispatch tallies
+in the form `sc{N}/M (kind, loop_id=Lx, branch_idx=B) |
+dispatches: <V> valid / <U> unknown / <E> errors / <total>`.
+A naive reading is "if each sc has ≥1 V, the synth should
+close."  **That's wrong.**  Per-sc V means "this constraint
+HAS at least one τ-subset that validates it"; global SAT
+needs a **single τ-subset that validates ALL constraints
+simultaneously**.
+
+If you see `sc4: 32V / 9U / 6E` and `sc7: 12V / 0U / 0E`
+but global SAT returns `NoSolution(reason="unsat")`, the
+bottleneck is **intersection**: every τ-subset that sc4
+accepts is REJECTED by sc7 (or vice versa).  The hint
+"valid attribute classes per constraint were found, but
+no Boolean assignment satisfies all of them simultaneously"
+is the canonical surfacing of this.
+
+Triage shortcut: with F18 the rejection hint now names
+the bottleneck (`sc7 (safety-bundle-post, L0): full-τ
+{0,1,2,3} → UNKNOWN → rejected`).  Start with that sc's
+dump.  If the dump is the FULL-τ subset (no `_partial`
+infix), your τ doesn't carry enough atoms to discharge
+this obligation — go back to REC 1 and consider what
+atoms the goal needs.  If the dump is partial-τ, the
+constraint is genuinely under-satisfied even with the
+full atom set, and you need a richer encoding (UF +
+axiom, a new τ atom, or a per-branch helper).
+
+### Signal 7.5 — Helper-citation codegen (Phase H.2.CODEGEN)
+
+When a benchmark ships a `helper_registry` (see kadane, majority,
+modular_exponentiation, floyd_warshall), the Lean dispatch path
+tries Tier-3 helper citation BEFORE running the generic mathlib
+tactic chain.  If the chosen-atom subset matches a HelperEntry's
+`required_atoms`, the solver emits a one-line
+`exact <helper> <args>` proof.  Per-call cost drops 30-60s → 2-5s.
+
+**Coverage metric.**  `SolveResult.hints` (and `NoSolution.hints`)
+emits a line like:
+
+> Helper coverage: 312/1400 dispatches via Tier-3 helper
+> (22.3%); 1088 fell through to generic tactic chain.
+
+If coverage is unexpectedly low for a benchmark with a registry,
+likely causes:
+- The helper's `required_atoms` doesn't match the τ subsets the
+  enumeration actually picks (atom indices renumbered? subsets
+  smaller than required_atoms? — supersets DO match by design).
+- The `applies_to` predicate is too narrow (e.g., gated on the
+  wrong `loop_id` or `branch_idx`).
+- The synth went through a path that isn't in the registry (e.g.,
+  a `safety` inductive when the registry only covers
+  `safety-bundle-post`).
+
+**Full-τ short-circuit.**  When a helper covers the full-τ
+subset, the solver emits ONLY that cube — pinning every relevant
+indicator True.  The synthesized solution therefore carries the
+FULL τ atom set, NOT a score-minimal subset.  This is by
+design (sound, but loses score-minimization).  Per-atom helpers
+(deferred — see RESEARCH.md task #170) would recover the
+minimization.
+
+**Routing allowlist.**  Lean dispatch fires for kinds in
+`_AXIOM_HEAVY_DISPATCH_KINDS = {safety, safety-bundle-entry,
+safety-bundle-post, coverage}`.  **ranking-* stays on Z3** — they
+are linear arithmetic and Lean dispatch's `lake env lean`
+per-call overhead causes wall-clock blowup (Lesson #46).  If
+you're tempted to add a new kind to the allowlist, run a
+regression first on kadane / modexp — they're the canaries.
+
+**`_on_z3_sat` cross-check is selective.**  The cross-check that
+fires after the main SAT picks an assignment skips kinds in
+`_AXIOM_HEAVY_DISPATCH_KINDS`.  This avoids spurious Z3 verdicts
+on empty-τ ranking constraints (Lesson #49).  If you see a Lean
+dispatch error referencing a `ranking-*` kind, suspect the
+cross-check allowlist drifted.
+
+### Signal 8 — Synth wall-clock regressed after a routing change
+
+If you added a new kind to `_AXIOM_HEAVY_DISPATCH_KINDS` (or to
+the Lean dispatch path generally), and kadane / modexp / majority
+now wall-clock past 10 min: revert.  Lean dispatch is process-
+bound (~3-5s per `lake env lean` invocation); routing a kind
+with many enumerated subsets onto that path multiplies cost.
+The kanonical example: ranking-* on Lean dispatch caused both
+kadane_v5 and modexp_v5 to timeout at 10 min during the H.2.CODEGEN
+validation.
+
+Triage:
+1. `git diff synth/solver.py | grep -A2 _AXIOM_HEAVY_DISPATCH_KINDS`
+   — what kinds were added recently?
+2. Run kadane or modular_exponentiation alone.  If they regressed,
+   revert the routing change.
+3. ranking-decrease / ranking-lb / ranking-proc-* MUST stay on
+   Z3.  They are linear; Z3 handles them in milliseconds.
+
+### Signal 8.5 — Encoding: quantifier-in-τ vs UF-with-axioms
+
+When `solve()` produces **no output at all** (not even
+attribute-class count) on a benchmark with `ForAll(lambda r,
+s: ...)` τ atoms AND empty `uninterpreted` / `axioms`: the
+synth is stuck in Z3's quantifier-instantiation reasoning.
+
+Diagnostic chain:
+  1. **Check if the τ has direct quantifiers.**  `grep -n
+     "ForAll\|Exists" benchmarks/.../X.py | grep "tau@"` will
+     show them.
+  2. **Check if the Problem has UFs/axioms.**  If
+     `uninterpreted = []` and no `axioms`, the synth's
+     `_axiom_heavy_lean_path` is False — every constraint
+     stays on Z3.
+  3. **Find any .failed.lean dumps** for the benchmark.
+     If ZERO dumps after multi-minute synth, Z3 is wedging
+     before reaching Lean dispatch.
+
+Fix: encode the universal as a recursive UF + axioms (see
+`problem.skill` REC 11 for the pattern).  Examples:
+  - sortedness `∀r,s. r ≤ s < n → A[r] ≤ A[s]`  →
+    `is_sorted(A, n) == 1` with recurrence axiom.
+  - count `∀v. count(A, n, v) = ...`  →
+    `count_eq(A, n, v)` UF (kadane / majority pattern).
+  - subarray sum  →  `sum_range(A, p, q)` UF (kadane).
+
+After the rewrite, the synth triggers the H.2.CODEGEN
+dispatch path; per-class Lean checks become tractable.
+Helpers can short-circuit the full-τ subset (see Signal
+7.5).
+
+**Banked**: merge_two_sorted (2026-05-19).  v2 with
+direct-quantified τ produced ZERO output in 10 min.  v3
+with `is_sorted` UF + axioms produced 39 `.failed.lean`
+dumps in 10 min — same wall clock, but now the synth is
+making progress (just needs helpers to close the dumps).
+
+### Signal 9 — Cost-invariant debugging (north star #1)
+
+When `Problem.cost_target` is set, three soundness-critical
+kinds enter the dispatch pipeline: `cost-lb`, `cost-decrement`,
+`cost-budget`.  Common failure modes:
+
+- **UNSAT on a cost-bound benchmark**: the supplied
+  `cost@<lid>` candidate is too tight.  Run with
+  `cost_target` removed (drops back to correctness +
+  termination only); if synth succeeds, the gap is in the
+  cost layer.  Diagnose via the same Signal-1/6 pattern but
+  inspecting `cost-*` constraints.  Common fix: a looser
+  `cost@<lid>` candidate (e.g., `n - i + 1` instead of
+  `n - i`).
+- **Wall-clock blowup on `cost-decrement`**: cost atom is
+  quadratic or higher-degree polynomial (e.g.,
+  `(n - i) * (n + 2)`).  Z3's NIA solver chews through these
+  but slowly — `bubble_sort_cost` pays ~28s.  Today the
+  workaround is to accept the cost; an aggressive
+  "always-route quadratic cost to Lean" gate was tried and
+  reverted (per-subset `lake env lean` overhead exceeded NIA
+  total).  See `COST_INVS.md` §2 follow-up.
+- **Silent UNKNOWN on Lean cost-* dispatch**: if you see
+  `cost-decrement` going to Lean and returning UNKNOWN
+  immediately (no proof attempt visible in the dump), check
+  that the translator emits `import SynthLean.CostLemmas` at
+  file head (NOT just `open SynthLean.CostLemmas`).  Bug
+  fixed in commit `2506cdd`; regression would re-introduce
+  silent UNKNOWN.
+- **Tier-3 helper needed for matching-style cost obligations**:
+  generic Lean tactics (`omega`, `nlinarith`, `aesop`,
+  `simp_all`) don't instantiate quantified UF axioms cleanly.
+  Even "simple" matching benchmarks like
+  `bench_glover_verify.py` need a Tier-3 helper file (see
+  `sc7_fallthrough_62a3480b.solved.lean`).  Follow the same
+  Tier-3 authoring workflow as for axiom-heavy non-cost
+  benchmarks (problem.skill "Tier-3 helpers").
+
+Inspect cost obligations:
+```python
+from synth.expand import expand
+from synth.constraints import generate
+scaffold = expand(problem)
+system = generate(problem, scaffold)
+for sc in system.safety:
+    if sc.kind.startswith("cost"):
+        print(f"{sc.kind}: {sc.body}")
+```
+
+### Signal 10 — Lean / Z3 obligation parity (lesson #66)
+
+When the chain-aware Lean translator emits a stronger
+hypothesis set than the Z3-side constraint, Lean can VALIDATE
+classes Z3's actual obligation cannot prove.  The synth
+includes those classes in cubes; the final solution relies on
+Z3's weaker obligation being valid, which it might not be.
+**This is a soundness bug** — Lean over-validates relative to
+the underlying SAT problem.
+
+**Pattern that caused this**: a `constraints.py` change to the
+Z3-side abstract Loop transition (e.g., dropping `¬g` for
+break-capable Loops in K.D) without the parallel change to
+`_emit_chain_item_hyps` in the Lean translator.  Lean kept
+emitting the stronger `¬g_inner` hypothesis; Z3 didn't have
+it; obligations Z3 saw became weaker than what Lean was
+proving.
+
+**Mechanical fix**: every change to which hypotheses the Z3
+constraint includes (or excludes) for an IR construct must be
+mirrored in:
+  - `synth/lean_backend/translate.py:_emit_chain_item_hyps`
+    (chain-aware path; emits Loop / SB items as hypotheses).
+  - The corresponding `theorem_for_<kind>` translator's
+    hypothesis emission for the target obligation.
+
+**Triage**:
+  1. If you recently changed `constraints.py` for a specific
+     IR construct (Loop, SB, Recur), grep `_emit_chain_item_hyps`
+     and the relevant translator for the symmetric change.
+  2. Smoke-test: pick a benchmark that exercises the
+     construct; print the synthesized cubes and verify the
+     resulting program against `runtime_check=True` Python
+     emission.  If `ProofViolation` fires, the Lean-vs-Z3
+     hypothesis gap is the likely cause.
+  3. K.D specifically: break-capable Loops drop `¬g` from
+     the abstract transition; the Lean side now matches.  If
+     a future construct adds a similar "exit may have guard
+     still true" semantics (e.g., `continue`, exceptions),
+     the parity must be re-checked.
+
+### Signal 11.5 — `NoSolution(reason="needs-helpers")` (K.D.W)
+
+The per-constraint wedge detector (Phase K.D.W, 2026-05-25)
+abandoned at least one constraint after `2 × wedge_threshold`
+non-valid Lean dispatches.  Synth returns
+`NoSolution(reason="needs-helpers")` with hints listing each
+wedged constraint by `(kind, loop_id, branch_idx)` plus a
+sample `.failed.lean` dump path.
+
+**Diagnosis**:
+
+  1. Read the hints — they tell you exactly which sc<N>
+     wedged and what its kind / loop / branch was.
+  2. Inspect `ls dump_dir/sc<N>_*.failed.lean` — pick a
+     representative dump and look at the obligation shape.
+  3. Decide: does this need a Tier-3 helper (algorithm
+     correctness fact the user's τ atoms don't capture)?
+     Usually yes for wedge-detector-flagged constraints.
+  4. Author the helper (Tier-2-first workflow; see CLAUDE.md
+     "Always-on reminders") and wire it into
+     `helper_registry`.
+  5. Re-run synth.  If another constraint wedges, repeat.
+
+**Don't bump `wedge_threshold` to mask the wedge.**  The
+default 30 is calibrated so legitimate axiom-heavy
+benchmarks don't false-flag.  A real wedge means a real
+helper is missing; making the threshold higher just trades
+fast feedback for a longer silent wait.
+
+**Soundness preserved**: the abandoned constraint's
+valid-cubes list is empty-or-partial, so the main SAT
+UNSATs it cleanly and synth returns `NoSolution` — never an
+unverified solution.  See SOUNDNESS.md.
+
+**Validated** on `bench_aug3_two_loops` with
+`helper_registry=None` + `wedge_threshold=10`: all 4 wedge-
+prone constraints surface in 830s instead of a silent
+multi-hour wedge.  K.3.2 3-nested loops first run flagged
+sc1's missing helper at 60 dispatches.
+
+### Signal 11.6 — Helper short-circuit not firing (Slice 2.B, lesson #70)
+
+**Symptom**: a Tier-3 helper validates the constraint in
+isolation (smoke-test via `verify_class_via_lean` returns
+VALID with `via_helper=True`).  But during synth, the helper
+short-circuit silently skips that constraint — solver hints
+show `Helper coverage` lower than expected, or the constraint
+falls through to generic Lean / wedges entirely.
+
+**Likely cause**: `sc.atom_refs` is empty for that
+constraint.  The `_extract_loop_id(sc)` helper falls back to
+inspecting atom_refs when there's no explicit loop_id, and
+returns None if atom_refs is empty.  Helper short-circuit
+then gates out because the routing predicate
+(`applies_to(sc_kind, loop_id, branch_idx)`) was authored
+with a specific `loop_id` and won't fire on None.
+
+**When this happens**: most commonly, the constraint is on
+the SECOND (or later) Cartesian path through a chain
+containing a multi-branch SB.  Pre-Slice 2.B,
+`chain_paths_local` was a generator that called `tau_at(...)`
+during `per_item` construction, appending refs to a shared
+mutable accumulator; the FIRST yielded path's commit
+captured AND CLEARED the accumulator; subsequent paths
+yielded with `atom_refs=[]`.  Lesson #70.
+
+**Detection**: print atom_refs counts across constraints of
+the same kind/loop_id:
+
+```python
+from synth import expand, generate_constraints
+problem = ...
+expand(problem)
+constraints = generate_constraints(problem)
+for i, sc in enumerate(constraints):
+    print(f"sc{i} kind={sc.kind} loop_id={sc.loop_id} "
+          f"branch_idx={sc.branch_idx} "
+          f"atom_refs={len(sc.atom_refs)}")
+```
+
+Two constraints with the same `(kind, loop_id)` but very
+different `len(atom_refs)` — especially `0` on one of them —
+indicates a generator-vs-mutation bug like Slice 2.B's
+chain_paths_local.
+
+**Fix pattern**: snapshot the accumulator at generator entry,
+restore per yielded iteration.  See `synth/constraints.py:
+chain_paths_local` for the canonical pattern.
+
+**Soundness-adjacent note**: before the fix, second-Cartesian-
+path constraints had no `loop_id` binding.  Cubes might
+have been emitted without proper gating.  In practice no
+unsound code shipped on the affected benchmarks (the gating
+was inferred correctly enough by other means), but the
+invariant was broken.
+
+### Signal 11.7 — Helper signature dispatch (Slice 2.C, lesson #74)
+
+**Symptom**: Helper cite fails with Lean errors like
+`unknown identifier 'n_s0'` or `unknown identifier 'u_prime'`.
+The helper signature uses one shape (FLAT or chain-aware)
+but the translator's emitted theorem uses the other.
+
+**Cause**: `verify.py`'s dispatch decides FLAT vs chain-aware
+on a per-constraint basis depending on the chain prefix to
+the constraint's target.  Two helpers in the same benchmark
+may need different shapes — Slice 2.C's
+`bench_max_matching_concrete.py` has sc1/sc6/sc14/sc15 as
+FLAT and sc2/sc3/sc9/sc11 as chain-aware.
+
+**The rule** (extension of lesson #69):
+  - If the chain prefix to the constraint's target has ONLY
+    SB items (no Loops), the translator dispatches to FLAT
+    (`theorem_for_chain_bundle`, `theorem_for_safety_inductive`):
+    bare pre-state names + primed post-state for modified
+    vars.
+  - Otherwise (Loop in the prefix, or nested target),
+    chain-aware (`theorem_for_chain_bundle_chain`, etc.):
+    per-state binders `<var>_s<k>` indexed by chain position.
+
+**Diagnosis pattern**:
+
+1. Run synth; observe the failed helper cite (look for
+   `unknown identifier` in the synth output or in a
+   `.failed.lean` dump).
+2. Emit the translator's theorem for that constraint to see
+   the actual binder shape:
+
+   ```python
+   from synth import expand, generate_constraints
+   from synth.lean_backend.verify import verify_class_via_lean
+   problem = ...
+   expand(problem)
+   constraints = generate_constraints(problem)
+   sc = constraints[N]  # the failing constraint
+   # Look at sc.kind, sc.loop_id, sc.branch_idx, sc.chain_prefix
+   # to decide FLAT vs chain-aware
+   ```
+
+3. Smoke-test the helper directly via
+   `verify_class_via_lean` with a chosen-atoms dict.  If it
+   validates, the helper signature is correct and the gate
+   issue is something else (`atom_refs` empty — Signal 11.6,
+   lesson #70).  If it fails, the signature shape is wrong.
+4. Rewrite the helper signature to match.  Common fix: swap
+   `n_s0` ↔ `n`, `u_s1` ↔ `u_prime`, etc.
+
+**Mitigation**: smoke-test EVERY new helper individually
+via `verify_class_via_lean` before running synth.  Slice
+2.C's commits `ed43dd3` (sc1 helper FLAT-shape fix) and
+`830c52c` (sc6 helper guard signature fix) were post-hoc
+corrections that would have surfaced earlier with
+per-helper smoke testing.
+
+### Signal 11.8 — Concrete-predicate audit (Slice 2.C, lesson #73)
+
+**Symptom**: After concretizing a UF + axiom into atomic
+τ-atoms, the corresponding preservation theorem (e.g.,
+"this transition preserves the matching invariant") refuses
+to close.  Case analysis assumes some property that the
+concrete predicate doesn't enforce.
+
+**Example from Slice 2.C**: `flip_preserves_im` case-splits
+on `kk ∈ {u, v, M v, w}` vs otherwise.  The case `kk = v`
+requires `M[v] ≠ v` (so `M[v]` isn't accidentally `v`
+itself).  The 3-atom predicate (range / symm / edge) doesn't
+enforce this; the proof can't close.
+
+**Cause**: when a UF (`IsMatching`) is paired with axioms
+(`mm_flip_preserves_matching`, etc.), the axioms often
+IMPLICITLY assume mathematical properties of the UF that
+aren't stated as separate atoms.  In Slice 2.B's
+axiomatization, "matchings exclude self-loops" was implicit;
+the axiom statement didn't need an explicit `M[k] ≠ k`
+hypothesis because the UF semantics enforced it.
+
+When the UF is replaced by a concrete predicate, every
+implicit property must be lifted to an explicit τ atom.
+
+**Diagnosis pattern**:
+
+1. Identify the load-bearing transition-preservation
+   theorem (`flip_preserves_im` in Slice 2.C).
+2. Audit the proof's case analysis.  Which cases require
+   what hypotheses?
+3. Cross-reference with the τ atoms.  Are all required
+   hypotheses in the predicate?
+4. If a case requires `M[k] ≠ k` (or analogous
+   self-exclusion / distinctness property) and there's no
+   atom for it, ADD that atom.  See REC 16 in problem.skill.
+
+**Mitigation**: when concretizing a UF + axiom abstraction,
+write the preservation proof FIRST (in scratch, see
+CLAUDE.md "iterate in scratch first") to surface all
+required atoms.  Then commit the concrete predicate with
+that complete atom set.
+
+### Signal 11 — Fpre propagation (K.D)
+
+Pre-K.D, inner constraints inside nested loops did NOT see
+the top-level `Fpre` in their antecedents.  Authors had to
+forward immutable input facts (`n >= 0`, dimension
+constraints, etc.) by adding them as outer τ atoms — which
+both bloated |τ_outer| and made the per-class enumeration
+2× larger per added atom.
+
+Post-K.D (2026-05-25), `Fpre` is propagated into recursive
+`walk_template` calls.  Inner inductives and bundle
+obligations have it in their antecedent directly.
+
+**Symptom that's now auto-fixed**: UNSAT with hint mentioning
+an input fact unreachable in an inner inductive.  If you
+still see this post-K.D, the gap is NOT Fpre routing — look
+for a genuine τ atom gap (Signal 6) or a constraint-emission
+gap (Signals 1-3).
+
+**Do not add Fpre conjuncts to outer τ as a workaround.**
+That pattern is obsolete.  Either Fpre is already carried
+(K.D path) or the problem is elsewhere.
+
+### Signal 7 — Lean cache hit rate as a curation health metric
+
+The solver hint emits (when Lean fallthrough fires):
+
+> Lean fallthrough: N valid, M unknown, K error (out of N+M+K
+> calls).
+
+The breakdown is informative:
+- **High `valid`** (>70%): the curated `.solved.lean` cache is
+  doing its job.  If synth still UNSAT, the issue is τ-atom
+  gap (Signal 6) or τ subsets the synth tries but you haven't
+  dumped/curated yet.
+- **High `unknown`** (Lean generic chain timed out): the τ
+  subsets aren't cached; the generic tactic chain is too weak.
+  Either curate more `.solved.lean` companions or strengthen
+  the generic chain (Day 7 tactic-engineering work).
+- **High `error`** (Lean returned non-zero exit): translator
+  bug or malformed obligation.  Inspect the `.failed.lean`
+  dump's stderr (in the comment header) for the Lean error.
+  Possibly a τ shape the translator doesn't handle.
+
+Diagnostic for the cache-hit-rate ceiling: if you have N
+.solved.lean files but the synth makes M >> N Lean calls, the
+synth is enumerating τ subsets you haven't curated.  Each
+miss costs ~15s of Lean generic-chain timeout under sound
+mode.  Worked example: `modular_exponentiation` first run had
+16 .solved.lean, 632 calls, 75% hit rate — telling us the
+synth tried ~470 covered subsets and ~154 uncovered.  Solution
+is more curation OR fewer τ subsets to enumerate (smaller τ
+atom set, or stronger constraints to short-circuit
+enumeration).
+
+---
+
+## Inspection commands
+
+### Dump every safety constraint emitted
+
+```python
+from synth.expand import expand
+from synth.constraints import generate
+scaffold = expand(problem)
+system = generate(problem, scaffold)
+print(f"constraints: {len(system.safety)}")
+by_kind = {}
+for sc in system.safety:
+    by_kind[sc.kind] = by_kind.get(sc.kind, 0) + 1
+for k, v in sorted(by_kind.items()):
+    print(f"  {k}: {v}")
+for i, sc in enumerate(system.safety):
+    print(f"#{i} {sc.kind}:")
+    print(f"  {sc.body}")
+```
+
+Useful kinds to check:
+- `safety` — bundle / inductive / entry implications.
+- `coverage` — `⋁ g_i ≡ true` for multi-branch SBs.
+- `ranking-decrease` — Loop ranking decrease.
+- `ranking-lb` — Loop ranking lower bound.
+- `ranking-proc-decrease` — per-procedure decrease for recur atoms.
+- `ranking-proc-lb` — global procedure ranking lower bound.
+
+**If a `kind` you expected is missing** — that's the bug.  E.g., the
+SB-in-Loop-body case once had no `coverage` constraints; the
+SB-branch-recur case had no `ranking-proc-decrease`.
+
+### Inspect atom-position classification
+
+For each safety constraint, which τ atoms appear in antecedent vs
+consequent vs both:
+
+```python
+from synth.solver import _classify_atoms
+for i, sc in enumerate(system.safety):
+    cls = _classify_atoms(sc)
+    if not cls:
+        continue
+    print(f"#{i} {sc.kind}:")
+    by_pos = {"ANT": [], "CONS": [], "BOTH": []}
+    for (hid, idx), poses in cls.items():
+        if poses == {False}: by_pos["ANT"].append((hid, idx))
+        elif poses == {True}: by_pos["CONS"].append((hid, idx))
+        else:                  by_pos["BOTH"].append((hid, idx))
+    for k, v in by_pos.items():
+        if v: print(f"  {k}: {v}")
+```
+
+Phase 3.L's fast path collapses single-position holes to one check.
+BOTH-position atoms keep their full 2^n enumeration.  If a constraint
+is unexpectedly slow, count its BOTH atoms.
+
+### Smoke-test a helper via `verify_class_via_lean` BEFORE shipping
+
+Before committing a new Tier-1/Tier-3 helper, smoke-test it
+individually against the synthesizer's translator to confirm
+the signature shape matches the translator's emitted theorem.
+This catches FLAT-vs-chain-aware mismatches (Signals 11.7,
+lesson #74), missing primed-var binders, and `required_atoms`
+gating bugs (Signal 7.5 / lesson #78) BEFORE running a
+multi-minute synth and getting a `needs-helpers` verdict.
+
+```python
+from synth import expand
+from synth.lean_backend.verify import verify_class_via_lean
+problem = ...
+expand(problem)
+verdict = verify_class_via_lean(
+    problem,
+    chosen_atoms={...},     # full chosen-atom dict including s@*/g@*/phi@*/tau@*
+    sc_kind="safety-bundle-post",
+    loop_id="L0",
+)
+print(verdict.status, verdict.elapsed_s, verdict.via_helper)
+```
+
+If `verdict.via_helper` is True and `status == "valid"`, the
+helper fires correctly.  If it's False (helper short-circuit
+didn't fire), check:
+  - The helper's `applies_to(sc_kind, loop_id, branch_idx)`
+    predicate.
+  - The helper's `required_atoms` declaration (does it
+    overlap the full chosen subset?).
+  - The cite lambda's binder names against the translator's
+    actual output (`theorem_for_<kind>(...)`).
+
+If `status == "unknown"` or `"error"`, the helper signature
+is wrong (Lean's `unknown identifier` or type-mismatch error).
+
+This is especially important for chain-aware translators where
+binder names depend on the chain prefix structure — FLAT
+shapes use bare `<var>` / `<var>'` names; chain-aware shapes
+use `<var>_s<k>` indexed by chain position.  The dispatch can
+flip per-constraint within a single benchmark (Slice 2.C
+sc1/sc6/sc14/sc15 FLAT vs sc2/sc3/sc9/sc11 chain-aware).
+
+### Print indicator → atom mapping for a solution
+
+```python
+result = solve(problem)
+sol = result.best
+print(f"score: {sol.score}, atoms_chosen:")
+for k, v in sorted(sol.atoms.items()):
+    print(f"  {k}: {v}")
+```
+
+`sol.atoms[hole_id]` gives the chosen atom for each hole.  For τ
+holes (conjunctive), it's a list of selected atom strings.
+
+---
+
+## Writing a soundness regression guard
+
+Pattern that works: a benchmark with both a SOUND option and a
+DEGENERATE option in the same hole, plus a ranking that
+distinguishes them.  Then assert the chosen option:
+
+```python
+from synth import Problem, Loop, SB, Var, solve
+
+PROBLEM = Problem(
+    template = Loop(SB(n=2)),
+    inputs   = [Var("n", "int", "input")],
+    outputs  = [Var("n", "int", "output")],
+    pre      = "n >= 0",
+    post     = "n == 0",
+    atoms = {
+        "tau@L0": ["n >= 0"],
+        "g@L0":   ["n > 0"],
+        "phi@L0": ["n"],
+        "g@B0.0": ["n == 5"],
+        "s@B0.0": [
+            {"_recur": True, "args": {"n": "n - 1"}, "ret": {"n": "n"}},  # sound
+            {"_recur": True, "args": {"n": "n"},     "ret": {"n": "n"}},  # degenerate
+        ],
+        "g@B0.1": ["n != 5"],
+        "s@B0.1": [{"n": "n - 1"}],
+        "phi@PROC": ["n", "1"],
+    },
+)
+
+result = solve(PROBLEM)
+chosen = result.best.atoms["s@B0.0"]
+assert chosen.get("args", {}).get("n") == "n - 1", \
+    f"synthesizer accepted non-decreasing recur: {chosen}"
+```
+
+See `benchmarks/cover_loop_branched_recur.py` and
+`benchmarks/cover_chain_branched_recur.py` for the live versions.
+
+When you find a new constraint-emission gap, add a cover benchmark
+that exercises it before fixing.
+
+---
+
+## UNSAT debugging
+
+`solve()` returns `NoSolution(reason="unsat", ...)`.  Common
+causes:
+
+- **Missing atom in some τ hole**: a necessary conjunct for proving
+  inductivity isn't in the candidate list.  E.g., for a sort
+  benchmark, missing the suffix-sortedness atom.  Check
+  `result.hints` for diagnostic strings the solver attached.
+- **Spec too strong**: the post requires more than what's
+  achievable with the given template + atoms.  Try weakening.
+- **Pre too weak**: the precondition doesn't constrain inputs
+  enough; the synthesizer must handle states it can't actually
+  reach in practice.
+
+To narrow:
+
+```python
+result = solve(problem)
+print(result.reason)
+for h in result.hints:
+    print(f"  hint: {h}")
+print(f"  hole sizes: {result.pinned_unknowns}")
+```
+
+Then bisect: comment out atoms until SAT, identify what was
+essential.  Add the missing predicate.
+
+---
+
+## Timeout debugging
+
+`solve()` returns `Timeout(reason="timeout", ...)`.  Common causes
+(see `problem.skill` REC 1 / tractability table):
+
+- **Too many atoms in a τ hole** that's in BOTH position on the
+  inductive constraint.  Aim for ≤7 atoms.
+- **Composite atoms** instead of atomic (REC 3).  Decompose.
+- **Quantified atoms inside the inductive** when the bound
+  variable's pattern set is large.  Z3 takes longer per check.
+
+Diagnose:
+
+```python
+# Print how many attribute-class checks the enumeration ran:
+result = solve(problem)
+for h in result.hints:
+    print(h)  # includes "after N attribute-class checks, Xs"
+```
+
+If hint shows "after 10000 attribute-class checks, 60s" — too many
+atoms.  Trim distractors from τ holes.
+
+If hint shows "after 50 attribute-class checks, 60s" — each check
+is slow.  Likely quantified atoms in inductive with bad triggers.
+
+---
+
+## Emitter debugging
+
+The C emitter is in `synth/emit_c.py`.  Common failures:
+
+### Compile failure with `-Wsometimes-uninitialized`
+
+Local declared without init, assigned only inside if/else branches.
+Our emitter init-to-0's all int locals (Lesson #25), so this should
+only happen if you added a new code path that declares without
+initializing.  See `_c_decl_with_init` (or wherever the local
+declarations are emitted).
+
+### Compile failure on parallel assignment
+
+If a transition like `{"x": "y", "y": "x"}` emits `x = y; y = x;`
+(broken parallel semantics), the temp-dance is missing.  See
+`_emit_parallel_dict` — it checks `_expr_references_any` and uses
+temps when needed.
+
+### Runtime hang
+
+Synthesizer accepted an unsound solution.  Switch back to
+"Soundness signals" — the bug is in `constraints.py`, not the
+emitter.
+
+### Recur emission produces bad C
+
+The Recur path is wrapped in `if (<Fpre@args>) { ... }` so pure
+`~`-style templates terminate (Phase 5.B).  If the C still
+infinite-recurses, the Fpre substitution may be wrong.  Print the
+generated C and trace the wrap manually.
+
+---
+
+## Performance debugging
+
+### Standalone vs regression timing
+
+A benchmark that runs in 1s standalone but 20s in regression is
+almost always **CPU contention** from stale child processes, not a
+real regression.  Check:
+
+```bash
+ps aux | grep -E "tmp.*/(max_array|intsqrt|bubble|…)" | grep -v grep
+```
+
+Anything pegged at 100% CPU is a leftover from a previous test
+invocation (subprocess.run on an unsound binary).  Kill them:
+
+```bash
+pkill -9 -f "tmp.*/binname"
+```
+
+This is the most common cause of confusing "regression" reports.
+Always check `ps` before believing a slowdown is real.
+
+### Hung Python processes
+
+If `solve()` doesn't return after 5+ minutes:
+
+1. `ps aux | grep python` — find the process, note its CPU time.
+2. If CPU time stopped growing, it's stuck on a subprocess (Z3 query
+   or shelled-out compile) — `pgrep -P <pid>` to find children.
+3. If a child process is the actual hang, that's where to look.
+4. Add `_PER_CHECK_TIMEOUT_MS` adjustments in `solver.py` if Z3 is
+   the culprit.
+
+### Identifying the cost driver
+
+If a benchmark is genuinely slow:
+
+```python
+import time
+from synth.expand import expand
+from synth.constraints import generate
+from synth.solver import solve as solver_solve
+
+t0 = time.monotonic()
+scaffold = expand(problem); t1 = time.monotonic()
+system = generate(problem, scaffold); t2 = time.monotonic()
+result = solver_solve(problem); t3 = time.monotonic()
+
+print(f"expand:   {t1-t0:.2f}s")
+print(f"generate: {t2-t1:.2f}s")
+print(f"solve:    {t3-t2:.2f}s")
+print(f"safety constraints: {len(system.safety)}")
+```
+
+Usually `solve` dominates.  Within `solve`, the enumeration phase is
+the cost driver — the PLDI'09 reduction enumerates 2^|τ| × per-hole
+options per constraint.
+
+---
+
+## Process hygiene (you'll thank yourself)
+
+Compiled benchmark binaries from earlier test runs are the #1 source
+of confusion.  They show up because:
+
+- `subprocess.run([binary])` without a timeout lets infinite-loop
+  binaries persist.  The Python test process gets killed; the child
+  binary keeps running, pinned at 100% CPU.
+- `tempfile.TemporaryDirectory()` cleans up the *directory* when the
+  context exits, not running processes that have the binary mmap'd.
+
+Prevent:
+
+- **Always use `subprocess.run([binary], timeout=15)`** (or similar).
+  Lesson #28.
+- Before reporting a slowdown, run `ps aux | grep tmp` and clean up
+  any stale binaries.
+- If a benchmark mysteriously hangs, kill it (`kill -9`) AND check
+  for orphaned child processes via `pgrep -P <pid>` before retrying.
+
+---
+
+## Z3 nondeterminism
+
+Z3 is deterministic given the same input, but Python module-level
+state (caches, default tactic settings, prior `Solver` instances)
+can shift heuristic preferences across calls.  Same `Problem` →
+same model, but the *score-tied* solutions may come back in a
+different order.
+
+When this matters:
+
+- The synthesizer enumerates top-K solutions sorted by score.  If
+  two solutions have identical score, which is `best` depends on
+  enumeration order, which can shift.
+- For benchmarks where multiple sound solutions exist, the choice
+  between them can flip across runs.  Build assertions on
+  *invariants of all sound solutions*, not on a specific one.
+
+Anti-pattern (fragile):
+```python
+assert result.best.atoms["s@B0"] == {"q": "0", "r": "x"}
+```
+
+Better (sound across all valid choices):
+```python
+chosen = result.best.atoms["s@B0"]
+assert "_recur" not in chosen, "expected non-recur initialization"
+assert chosen.get("q") == "0", "q must initialize to 0"
+```
+
+---
+
+## Lessons-banked tracebacks
+
+Each of these is a real bug.  When you hit a similar symptom,
+remember the fix pattern.
+
+- **#25** (Phase 5.A): coverage `⋁ g_i ≡ true` is invisible to the
+  C compiler.  Default-initialize int locals so `-Wsometimes-
+  uninitialized` doesn't flag the emitted code.
+- **#26** (soundness fix #1): coverage missing for SB-body-of-Loop.
+  Symptom: max_array's compiled binary infinite-looped because
+  branch guards `A[i] < m ∨ A[i] <= m` didn't cover `A[i] > m`.
+- **#27** (after fix #1): every multi-branch SB constraint must
+  be emitted *wherever the SB lives*, not just at the top of the
+  walk.  Future-proof structurally.
+- **#28** (Phase 5.A): add a runtime timeout to compile-and-run
+  tests.  Hanging tests mask diagnostics.
+- **#29** (Phase 5.B+): centralize constraint emission per IR
+  construct — one helper, every site calls it.
+- **#30** (Phase 5.B++): materialize generators at function entry
+  if any inner loop iterates them.  Exhausted-generator-silently-
+  skips-work is a real soundness bug pattern.
+- **#31** (Phase 5.B++): solution-count regression is a free
+  soundness proxy.  "N solutions before, N+k after refactor" with
+  the new ones looking degenerate ⇒ a constraint was dropped.
+- **#54** (2026-05-19): Tier-2-first authoring with focused
+  boundary axioms gives incremental commits.  When a τ atom
+  about an array "next" value runs into a boundary case,
+  introducing a tiny focused axiom (`is_sorted A n = 1 → A
+  (n-1) ≤ A n`) and proving the helpers with it is a clean
+  intermediate state.  Then an IR-level τ gating (REC 11.5
+  in problem.skill) eliminates the axioms entirely.
+- **#55** (2026-05-19): Chain-aware abstract Loop transition
+  is the precision limit for cross-loop relational obligations.
+  When the loop body modifies C, the abstract transition's
+  frame eqs don't include C — so C across the boundary can be
+  any value satisfying τ_inner.  This blocks `merge_l2_entry_chain`-
+  style ceilings: even with gated τ, the conclusion
+  `C_s3[i+j-1] ≤ A_s3[i_s3]` can't be derived from τ@L0 at
+  s2 because L1's transition admits arbitrary C_s3.  Diagnostic:
+  if a chain-aware bundle-entry/post obligation seems unprovable
+  even with strong τ atoms, check whether the conclusion
+  depends on C (or another loop-body-modified var) being
+  preserved across a Loop transition.  Workaround: add a
+  Tier-2 axiom; mark as ceiling in BENCHMARKS.STATUS.md.
+- **#66** (Phase K.D, 2026-05-25): Lean and Z3 verifier
+  obligations must be SEMANTICALLY EQUIVALENT, not just
+  "similarly shaped".  The chain-aware Lean translator's
+  `_emit_chain_item_hyps` had been emitting `¬g_inner` for
+  every Loop in the chain, including break-capable Loops.
+  Z3's `constraints.py` (after K.D dropped `¬g` for break-
+  capable Loops) didn't have that hypothesis.  Lean was
+  asked to prove a STRONGER statement than Z3 — Lean had
+  more hypotheses, so it could close obligations Z3
+  couldn't.  Class-valid signal from Lean propagated to
+  cube emission; final solution relied on Z3's actual
+  weaker obligation, unsoundly.  Fix: parallel translator
+  change to drop `¬g` for break-capable Loops.  See Signal
+  10.
+- **#67** (Phase K.D, 2026-05-25): Find-flag + outer-guard
+  `found == 0` is the standard encoding for early-exit
+  across nested loops.  The `_break: True` primitive only
+  exits the innermost Loop.  To short-circuit remaining
+  outer iterations, the inner-break branch sets `found := 1`,
+  and each outer loop's guard includes `found == 0`.  The
+  "increment-at-start" pattern keeps inner Loops as the
+  LAST item in their enclosing body chain (initialize
+  counters to `-1`, increment in the enclosing body's prep
+  SB).  This avoids K.D.2.a (chain-tail composition after
+  break).  Validated by `bench_aug3_two_loops.py`
+  (578s, 1 verified solution).  See problem.skill REC 12.
+- **#70** (Slice 2.B, 2026-05-25): `chain_paths_local`
+  generator-vs-mutation atom_refs bug.  Generator yielded N
+  Cartesian paths via a shared mutable `current_refs`
+  accumulator; first commit captured AND cleared the
+  accumulator; subsequent paths committed with empty
+  `atom_refs`.  Symptom: helper short-circuit silently
+  skipped on second+ Cartesian path (because
+  `_extract_loop_id` falls back to atom_refs and returns
+  None).  Detection: compare atom_refs counts across
+  constraints of same kind/loop_id; large discrepancy
+  indicates the bug.  Fix: snapshot accumulator at generator
+  entry, restore per yielded iteration.  See Signal 11.6.
+- **#71** (Slice 2.B, 2026-05-25): minimal-required-atoms
+  helper pattern.  When a helper's proof needs only 1-2 τ
+  atoms (not the full subset), declare `required_atoms` as
+  just that minimal subset.  Per-subset enumeration fires
+  the helper on EVERY subset containing those atoms,
+  eliminating partial-subset UNKNOWNs.  Example:
+  `mm_sc15_coverage` requires only τ@L0 atom 2 via `exact
+  h_tau_2.symm`; eliminates 8 sound-mode rejections at
+  once.  Detection: `Helper coverage: X/Y dispatches` lower
+  than expected ⇒ restrict `required_atoms` to the minimum
+  the helper actually needs.  See problem.skill helper
+  short-circuit section.
+- **#72** (Slice 2.B, 2026-05-25): procedure-level coverage
+  (`coverage` kind with `loop_id=None`) needs explicit kind
+  gate in solver.py's axiom-heavy Lean dispatch.  Standard
+  `_extract_loop_id(sc) is not None` filter excludes it,
+  but the translator (`theorem_for_coverage`) handles it
+  via `_find_top_level_multibranch_sb`.  Two-line
+  carve-out: route `coverage` with `loop_id=None` to Lean
+  when the benchmark has axioms.  Validated by
+  `bench_max_matching_recur.py`.
+- **#76** (Gale-Shapley, 2026-05-28): axiom-free trust is
+  a first-class goal, even at substantial extra proof-
+  engineering cost.  GS could have shipped 13 per-iteration
+  preservation lemmas as 3-line Tier-2 axioms; instead they
+  are Tier-1 PROVEN theorems (~270 LOC across ACCEPT +
+  REJECT branches).  Cost: half a day.  Win: zero algorithm-
+  step preservation axioms in the trust surface — only
+  base/step axioms that DEFINE the recursive UFs.  See
+  problem.skill REC 16.5.
+- **#77** (Gale-Shapley, 2026-05-28): the mod-cycled
+  `k_left` budget pattern is the standard fix for "no
+  nested scan" iteration-budget algorithms.  Any algorithm
+  naturally expressed as "while X exists, do Y" can be
+  reshaped to "for budget iterations: cycle through
+  candidates with mod; SKIP / DO / continue".  Avoids the
+  nested-loop framework gap (K.D.2.a chain-tail) entirely
+  at the cost of a loose iteration count.  See problem.skill
+  REC 15.5.
+- **#78** (Gale-Shapley, 2026-05-28): per-helper
+  `required_atoms` gating eliminates dead-end subset
+  enumeration.  When a helper's proof legitimately requires
+  ALL τ atoms (not just a minimal subset), declare the FULL
+  τ subset in `required_atoms`.  This keeps enumeration off
+  the wedging path — partial subsets that lack a needed
+  atom fall through cleanly rather than burning Lean
+  dispatches before timing out into UNKNOWN.  Detection:
+  `needs-helpers` verdict at safety-bundle-post despite a
+  helper that validates the full-τ subset; check whether
+  partial subsets are being enumerated and timing out.
+  Inverse rule to lesson #71 (minimal-required-atoms): use
+  minimal when the helper's proof needs few atoms; use full
+  when it needs many.
+
+---
+
+## When you're stuck
+
+If none of the above helps:
+
+1. Reduce to the smallest reproducer (one benchmark, minimal
+   atoms).  Often the bug becomes obvious.
+2. Print the entire `system.safety` and read it.  Z3 is opaque but
+   the IR is human-readable.
+3. Try the same synthesis problem with a SIMPLER spec (weaker post,
+   fewer atoms).  If it works, bisect to find the trigger.
+4. Check git log on `synth/` for recent changes that could have
+   introduced the bug.
+
+If the bug is in the synthesizer's core (constraint emission, Z3
+encoding), file a CLAUDE.md entry describing the symptom + minimal
+reproducer.  The lessons-banked log makes future LLM drivers more
+effective at debugging similar issues.
